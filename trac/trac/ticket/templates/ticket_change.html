@@ -1,4 +1,13 @@
-<!--!
+<!--!  Copyright (C) 2010-2014 Edgewall Software
+
+  This software is licensed as described in the file COPYING, which
+  you should have received as part of this distribution. The terms
+  are also available at http://trac.edgewall.com/license.html.
+
+  This software consists of voluntary contributions made by many
+  individuals. For the exact contribution history, see the revision
+  history and logs, available at http://trac.edgewall.org/.
+
 Render a ticket comment.
 
 Arguments:
@@ -24,7 +33,7 @@ Arguments:
                show_editor = can_edit_comment and str(cnum) == cnum_edit;
                show_history = str(cnum) == cnum_hist;
                max_version = max(change.comment_history) if change.comment_history else 0;
-               comment_version = int(cversion or 0) if show_history else max_version;
+               comment_version = as_int(cversion, max_version, 0, max_version) if show_history else max_version;
                show_buttons = not hide_buttons and not show_editor and comment_version == max_version"
       py:strip="">
   <py:def function="commentref(prefix, cnum, cls=None)">
@@ -59,7 +68,8 @@ Arguments:
     <span py:if="preview or show_editor" class="trac-loading"/>
   </h3>
   <div py:if="show_buttons" class="trac-ticket-buttons">
-    <form py:if="'cnum' in change and can_edit_comment" method="get" action="#comment:${cnum}">
+    <form py:if="'cnum' in change and can_edit_comment" id="edit-comment-${cnum}"
+          method="get" action="#comment:${cnum}">
       <div class="inlinebuttons">
         <input type="hidden" name="cnum_edit" value="${cnum}"/>
         <input type="submit" value="${captioned_button('✎', _('Edit'))}" title="${_('Edit comment %(cnum)s', cnum=cnum)}" />
@@ -106,7 +116,7 @@ Arguments:
   <form py:if="show_editor" id="trac-comment-editor" method="post"
         action="${href.ticket(ticket.id) + '#comment:%d' % cnum}">
     <div>
-      <textarea name="edited_comment" class="wikitext trac-resizable" rows="10" cols="78">
+      <textarea name="edited_comment" class="wikitext trac-fullwidth trac-resizable" rows="10" cols="78">
 ${edited_comment if edited_comment is not None else change.comment}</textarea>
       <input type="hidden" name="cnum_edit" value="${cnum}"/>
     </div>
@@ -114,7 +124,8 @@ ${edited_comment if edited_comment is not None else change.comment}</textarea>
       <input type="submit" name="preview_comment" value="${_('Preview')}"
              title="${_('Preview changes to comment %(cnum)s', cnum=cnum)}"/>
       <input type="submit" name="edit_comment" value="${_('Submit changes')}"
-             title="${_('Submit changes to comment %(cnum)s', cnum=cnum)}"/>
+             title="${_('Submit changes to comment %(cnum)s', cnum=cnum)}"
+             class="trac-disable-on-submit" />
       <input type="submit" name="cancel_comment" value="${_('Cancel')}"
              title="Cancel comment edit"/>
     </div>
@@ -126,7 +137,7 @@ ${edited_comment if edited_comment is not None else change.comment}</textarea>
       ${wiki_to_html(context, text, escape_newlines=preserve_newlines)}
     </div>
     <div py:when="show_history" class="comment searchable" xml:space="preserve">
-      ${wiki_to_html(context, change.comment_history[int(cversion)].comment, escape_newlines=preserve_newlines)}
+      ${wiki_to_html(context, change.comment_history[comment_version].comment, escape_newlines=preserve_newlines)}
     </div>
     <div py:when="change.comment" class="comment searchable" xml:space="preserve">
       ${wiki_to_html(context, change.comment, escape_newlines=preserve_newlines)}

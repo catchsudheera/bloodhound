@@ -48,18 +48,20 @@ from trac.core import *
 from trac.env import IEnvironmentSetupParticipant, ISystemInfoProvider
 from trac.mimeview.api import RenderingContext, get_mimetype
 from trac.resource import *
-from trac.util import compat, get_reporter_id, presentation, get_pkginfo, \
-                      pathjoin, translation
+from trac.util import as_bool, as_int, compat, get_reporter_id, html,\
+                      presentation, get_pkginfo, pathjoin, translation
 from trac.util.html import escape, plaintext
 from trac.util.text import pretty_size, obfuscate_email_address, \
                            shorten_line, unicode_quote_plus, to_unicode, \
-                           javascript_quote, exception_to_unicode
+                           javascript_quote, exception_to_unicode, to_js_string
 from trac.util.datefmt import (
-    pretty_timedelta, format_datetime, format_date, format_time,
+    pretty_timedelta, datetime_now, format_datetime, format_date, format_time,
     from_utimestamp, http_date, utc, get_date_format_jquery_ui, is_24_hours,
     get_time_format_jquery_ui, user_time, get_month_names_jquery_ui,
     get_day_names_jquery_ui, get_timezone_list_jquery_ui,
-    get_first_week_day_jquery_ui)
+    get_first_week_day_jquery_ui, get_timepicker_separator_jquery_ui,
+    get_period_names_jquery_ui)
+from trac.util.html import to_fragment
 from trac.util.translation import _, get_available_locales
 from trac.web.api import IRequestHandler, ITemplateStreamFilter, HTTPNotFound
 from trac.web.href import Href
@@ -115,6 +117,7 @@ def add_meta(req, content, http_equiv=None, name=None, scheme=None, lang=None):
             'scheme': scheme, 'lang': lang, 'xml:lang': lang}
     req.chrome.setdefault('metas', []).append(meta)
 
+
 def add_link(req, rel, href, title=None, mimetype=None, classname=None,
              **attrs):
     """Add a link to the chrome info that will be inserted as <link> element in
@@ -131,52 +134,43 @@ def add_link(req, rel, href, title=None, mimetype=None, classname=None,
     links.setdefault(rel, []).append(link)
     linkset.add(linkid)
 
+
 def add_stylesheet(req, filename, mimetype='text/css', media=None):
     """Add a link to a style sheet to the chrome info so that it gets included
     in the generated HTML page.
 
-    If the filename is absolute (i.e. starts with a slash), the generated link
-    will be based off the application root path. If it is relative, the link
-    will be based off the `/chrome/` path.
+    If `filename` is a network-path reference (i.e. starts with a protocol
+    or `//`), the return value will not be modified. If `filename` is absolute
+    (i.e. starts with `/`), the generated link will be based off the
+    application root path. If it is relative, the link will be based off the
+    `/chrome/` path.
     """
-    if filename.startswith(('http://', 'https://')):
-        href = filename
-    elif filename.startswith('common/') and 'htdocs_location' in req.chrome:
-        href = Href(req.chrome['htdocs_location'])(filename[7:])
-    else:
-        href = req.href
-        if not filename.startswith('/'):
-            href = href.chrome
-        href = href(filename)
+    href = chrome_resource_path(req, filename)
     add_link(req, 'stylesheet', href, mimetype=mimetype, media=media)
+
 
 def add_script(req, filename, mimetype='text/javascript', charset='utf-8',
                ie_if=None):
     """Add a reference to an external javascript file to the template.
 
-    If the filename is absolute (i.e. starts with a slash), the generated link
-    will be based off the application root path. If it is relative, the link
-    will be based off the `/chrome/` path.
+    If `filename` is a network-path reference (i.e. starts with a protocol
+    or `//`), the return value will not be modified. If `filename` is absolute
+    (i.e. starts with `/`), the generated link will be based off the
+    application root path. If it is relative, the link will be based off the
+    `/chrome/` path.
     """
     scriptset = req.chrome.setdefault('scriptset', set())
     if filename in scriptset:
         return False # Already added that script
 
-    if filename.startswith(('http://', 'https://')):
-        href = filename
-    elif filename.startswith('common/') and 'htdocs_location' in req.chrome:
-        href = Href(req.chrome['htdocs_location'])(filename[7:])
-    else:
-        href = req.href
-        if not filename.startswith('/'):
-            href = href.chrome
-        href = href(filename)
+    href = chrome_resource_path(req, filename)
     script = {'href': href, 'type': mimetype, 'charset': charset,
               'prefix': Markup('<!--[if %s]>' % ie_if) if ie_if else None,
               'suffix': Markup('<![endif]-->') if ie_if else None}
 
     req.chrome.setdefault('scripts', []).append(script)
     scriptset.add(filename)
+
 
 def add_script_data(req, data={}, **kwargs):
     """Add data to be made available in javascript scripts as global variables.
@@ -189,9 +183,11 @@ def add_script_data(req, data={}, **kwargs):
     script_data.update(data)
     script_data.update(kwargs)
 
+
 def add_javascript(req, filename):
-    """:deprecated: use `add_script` instead."""
+    """:deprecated: since 0.10, use `add_script` instead."""
     add_script(req, filename, mimetype='text/javascript')
+
 
 def add_warning(req, msg, *args):
     """Add a non-fatal warning to the request object.
@@ -200,11 +196,8 @@ def add_warning(req, msg, *args):
     the message is escaped (and therefore converted to `Markup`) before it is
     stored in the request object.
     """
-    if args:
-        msg %= args
-    msg = escape(msg, False)
-    if msg not in req.chrome['warnings']:
-        req.chrome['warnings'].append(msg)
+    _add_message(req, 'warnings', msg, args)
+
 
 def add_notice(req, msg, *args):
     """Add an informational notice to the request object.
@@ -213,11 +206,17 @@ def add_notice(req, msg, *args):
     the message is escaped (and therefore converted to `Markup`) before it is
     stored in the request object.
     """
+    _add_message(req, 'notices', msg, args)
+
+
+def _add_message(req, name, msg, args):
     if args:
         msg %= args
-    msg = escape(msg, False)
-    if msg not in req.chrome['notices']:
-        req.chrome['notices'].append(msg)
+    if not isinstance(msg, Markup):
+        msg = Markup(to_fragment(msg))
+    if msg not in req.chrome[name]:
+        req.chrome[name].append(msg)
+
 
 def add_ctxtnav(req, elm_or_label, href=None, title=None):
     """Add an entry to the current page's ctxtnav bar."""
@@ -226,6 +225,7 @@ def add_ctxtnav(req, elm_or_label, href=None, title=None):
     else:
         elm = elm_or_label
     req.chrome.setdefault('ctxtnav', []).append(elm)
+
 
 def prevnext_nav(req, prev_label, next_label, up_label=None):
     """Add Previous/Up/Next navigation links.
@@ -286,6 +286,8 @@ def web_context(req, resource=None, id=False, version=False, parent=False,
                      name)
     :return: a new rendering context
     :rtype: `RenderingContext`
+
+    :since: version 1.0
     """
     if req:
         href = req.abs_href if absurls else req.href
@@ -309,6 +311,68 @@ def auth_link(req, link):
     if req.authname != 'anonymous':
         return req.href.login(referer=link)
     return link
+
+
+def chrome_info_script(req, use_late=None):
+    """Get script elements from chrome info of the request object during
+    rendering template or after rendering.
+
+    :param      req: the HTTP request object.
+    :param use_late: if True, `late_links` will be used instead of `links`.
+    """
+    chrome = req.chrome
+    if use_late:
+        links = chrome.get('late_links', {}).get('stylesheet', [])
+        scripts = chrome.get('late_scripts', [])
+        script_data = chrome.get('late_script_data', {})
+    else:
+        links = chrome.get('early_links', {}).get('stylesheet', []) + \
+                chrome.get('links', {}).get('stylesheet', [])
+        scripts = chrome.get('early_scripts', []) + chrome.get('scripts', [])
+        script_data = {}
+        script_data.update(chrome.get('early_script_data', {}))
+        script_data.update(chrome.get('script_data', {}))
+
+    content = []
+    content.extend('jQuery.loadStyleSheet(%s, %s);' %
+                   (to_js_string(link['href']), to_js_string(link['type']))
+                   for link in links or ())
+    content.extend('var %s=%s;' % (name, presentation.to_json(value))
+                   for name, value in (script_data or {}).iteritems())
+
+    fragment = tag()
+    if content:
+        fragment.append(tag.script('\n'.join(content), type='text/javascript'))
+    for script in scripts:
+        fragment.append(script['prefix'])
+        fragment.append(tag.script(
+            'jQuery.loadScript(%s, %s, %s)' %
+            (to_js_string(script['href']), to_js_string(script['type']),
+             to_js_string(script['charset'])), type='text/javascript'))
+        fragment.append(script['suffix'])
+
+    return fragment
+
+
+def chrome_resource_path(req, filename):
+    """Get the path for a chrome resource given its `filename`.
+
+    If `filename` is a network-path reference (i.e. starts with a protocol
+    or `//`), the return value will not be modified. If `filename` is absolute
+    (i.e. starts with `/`), the generated link will be based off the
+    application root path. If it is relative, the link will be based off the
+    `/chrome/` path.
+    """
+    if filename.startswith(('http://', 'https://', '//')):
+        return filename
+    elif filename.startswith('common/') and 'htdocs_location' in req.chrome:
+        return Href(req.chrome['htdocs_location'])(filename[7:])
+    else:
+        href = req.href if filename.startswith('/') else req.href.chrome
+        return href(filename)
+
+
+_chrome_resource_path = chrome_resource_path  # will be removed in 1.3.1
 
 
 def _save_messages(req, url, permanent):
@@ -458,22 +522,30 @@ class Chrome(Component):
         """Height of the header logo image in pixels.""")
 
     show_email_addresses = BoolOption('trac', 'show_email_addresses', 'false',
-        """Show email addresses instead of usernames. If false, we obfuscate
-        email addresses. (''since 0.11'')""")
+        """Show email addresses instead of usernames. If false, email
+        addresses are obfuscated for users that don't have EMAIL_VIEW
+        permission. (''since 0.11'')
+        """)
 
     never_obfuscate_mailto = BoolOption('trac', 'never_obfuscate_mailto',
         'false',
         """Never obfuscate `mailto:` links explicitly written in the wiki,
-        even if `show_email_addresses` is false or the user has not the
-        EMAIL_VIEW permission (''since 0.11.6'').""")
+        even if `show_email_addresses` is false or the user doesn't have
+        EMAIL_VIEW permission (''since 0.11.6'').
+        """)
 
     show_ip_addresses = BoolOption('trac', 'show_ip_addresses', 'false',
-        """Show IP addresses for resource edits (e.g. wiki).
-        (''since 0.11.3'')""")
+        """Show IP addresses for resource edits (e.g. wiki). Since 1.0.5 this
+        option is deprecated and will be removed in 1.3.1. (''since 0.11.3'')
+        """)
 
     resizable_textareas = BoolOption('trac', 'resizable_textareas', 'true',
         """Make `<textarea>` fields resizable. Requires !JavaScript.
         (''since 0.12'')""")
+
+    wiki_toolbars = BoolOption('trac', 'wiki_toolbars', 'true',
+        """Add a simple toolbar on top of Wiki `<textarea>`s.
+        (''since 1.0.2'')""")
 
     auto_preview_timeout = FloatOption('trac', 'auto_preview_timeout', 2.0,
         """Inactivity timeout in seconds after which the automatic wiki preview
@@ -489,22 +561,30 @@ class Chrome(Component):
         format. (''since 1.0'')
         """)
 
+    use_chunked_encoding = BoolOption('trac', 'use_chunked_encoding', 'false',
+        """If enabled, send contents as chunked encoding in HTTP/1.1.
+        Otherwise, send contents with `Content-Length` header after entire of
+        the contents are rendered. (''since 1.0.6'')""")
+
     templates = None
 
-    # default doctype for 'text/html' output
-    default_html_doctype = DocType.XHTML_STRICT
+    # DocType for 'text/html' output
+    html_doctype = DocType.XHTML_STRICT
 
     # A dictionary of default context data for templates
     _default_context_data = {
         '_': translation.gettext,
         'all': all,
         'any': any,
+        'as_bool': as_bool,
+        'as_int': as_int,
         'classes': presentation.classes,
         'date': datetime.date,
         'datetime': datetime.datetime,
         'dgettext': translation.dgettext,
         'dngettext': translation.dngettext,
         'first_last': presentation.first_last,
+        'find_element': html.find_element,
         'get_reporter_id': get_reporter_id,
         'gettext': translation.gettext,
         'group': presentation.group,
@@ -606,11 +686,13 @@ class Chrome(Component):
         for provider in self.template_providers:
             for dir in [os.path.normpath(dir[1]) for dir
                         in provider.get_htdocs_dirs() or []
-                        if dir[0] == prefix]:
+                        if dir[0] == prefix and dir[1]]:
                 dirs.append(dir)
                 path = os.path.normpath(os.path.join(dir, filename))
-                assert os.path.commonprefix([dir, path]) == dir
-                if os.path.isfile(path):
+                if os.path.commonprefix([dir, path]) != dir:
+                    raise TracError(_("Invalid chrome path %(path)s.",
+                                      path=filename))
+                elif os.path.isfile(path):
                     req.send_file(path, get_mimetype(path))
 
         self.log.warning('File %s not found in any of %s', filename, dirs)
@@ -621,11 +703,11 @@ class Chrome(Component):
     def get_htdocs_dirs(self):
         return [('common', pkg_resources.resource_filename('trac', 'htdocs')),
                 ('shared', self.shared_htdocs_dir),
-                ('site', self.env.get_htdocs_dir())]
+                ('site', self.env.htdocs_dir)]
 
     def get_templates_dirs(self):
         return filter(None, [
-            self.env.get_templates_dir(),
+            self.env.templates_dir,
             self.shared_templates_dir,
             pkg_resources.resource_filename('trac', 'templates'),
         ])
@@ -676,10 +758,10 @@ class Chrome(Component):
         add_script(req, self.jquery_location or 'common/js/jquery.js')
         # Only activate noConflict mode if requested to by the handler
         if handler is not None and \
-           getattr(handler.__class__, 'jquery_noconflict', False):
+                getattr(handler.__class__, 'jquery_noconflict', False):
             add_script(req, 'common/js/noconflict.js')
         add_script(req, 'common/js/babel.js')
-        if req.locale is not None:
+        if req.locale is not None and str(req.locale) != 'en_US':
             add_script(req, 'common/js/messages/%s.js' % req.locale)
         add_script(req, 'common/js/trac.js')
         add_script(req, 'common/js/search.js')
@@ -705,24 +787,23 @@ class Chrome(Component):
                     category_section = self.config[category]
                     if category_section.getbool(name, True):
                         # the navigation item is enabled (this is the default)
-                        item = None
-                        if isinstance(text, Element) and \
-                                text.tag.localname == 'a':
-                            item = text
+                        item = text if isinstance(text, Element) and \
+                                       text.tag.localname == 'a' \
+                                    else None
                         label = category_section.get(name + '.label')
                         href = category_section.get(name + '.href')
-                        if href:
-                            if href.startswith('/'):
-                                href = req.href + href
+                        if href and href.startswith('/'):
+                            href = req.href + href
+                        if item:
                             if label:
-                                item = tag.a(label) # create new label
-                            elif not item:
-                                item = tag.a(text) # wrap old text
-                            item = item(href=href) # use new href
-                        elif label and item: # create new label, use old href
-                            item = tag.a(label, href=item.attrib.get('href'))
-                        elif not item: # use old text
-                            item = text
+                                item.children[0] = label
+                            if href:
+                                item = item(href=href)
+                        else:
+                            if href or label:
+                                item = tag.a(label or text, href=href)
+                            else:
+                                item = text
                         allitems.setdefault(category, {})[name] = item
                 if contributor is handler:
                     active = contributor.get_active_navigation_item(req)
@@ -815,7 +896,7 @@ class Chrome(Component):
     def populate_data(self, req, data):
         d = self._default_context_data.copy()
         d['trac'] = {
-            'version': pkg_resources.resource_string('trac', 'TRAC_VERSION').strip(),
+            'version': VERSION,
             'homepage': 'http://trac.edgewall.org/', # FIXME: use setup data
         }
 
@@ -848,8 +929,8 @@ class Chrome(Component):
             })
 
         try:
-            show_email_addresses = (self.show_email_addresses or not req or \
-                                'EMAIL_VIEW' in req.perm)
+            show_email_addresses = self.show_email_addresses or \
+                                   not req or 'EMAIL_VIEW' in req.perm
         except Exception, e:
             # simply log the exception here, as we might already be rendering
             # the error page
@@ -864,7 +945,14 @@ class Chrome(Component):
                 format = req.session.get('dateinfo',
                                          self.default_dateinfo_format)
             if format == 'absolute':
-                label = absolute
+                if dateonly:
+                    label = absolute
+                elif req.lc_time == 'iso8601':
+                    label = _("at %(iso8601)s", iso8601=absolute)
+                else:
+                    label = _("on %(date)s at %(time)s",
+                              date=user_time(req, format_date, date),
+                              time=user_time(req, format_time, date))
                 title = _("%(relativetime)s ago", relativetime=relative)
             else:
                 label = _("%(relativetime)s ago", relativetime=relative) \
@@ -884,12 +972,12 @@ class Chrome(Component):
         d.update({
             'context': web_context(req) if req else None,
             'Resource': Resource,
-            'Neighborhood': Neighborhood,
             'url_of': get_rel_url,
             'abs_url_of': get_abs_url,
             'name_of': partial(get_resource_name, self.env),
             'shortname_of': partial(get_resource_shortname, self.env),
             'summary_of': partial(get_resource_summary, self.env),
+            'resource_link': partial(render_resource_link, self.env),
             'req': req,
             'abs_href': abs_href,
             'href': href,
@@ -948,16 +1036,20 @@ class Chrome(Component):
         return self.templates.load(filename, cls=cls)
 
     def render_template(self, req, filename, data, content_type=None,
-                        fragment=False):
+                        fragment=False, iterable=False):
         """Render the `filename` using the `data` for the context.
 
         The `content_type` argument is used to choose the kind of template
-        used (`NewTextTemplate` if `'text/plain'`, `MarkupTemplate` otherwise),
-        and tweak the rendering process. Doctype for `'text/html'` can be
-        specified by setting the default_html_doctype (default is XHTML Strict)
+        used (`NewTextTemplate` if `'text/plain'`, `MarkupTemplate`
+        otherwise), and tweak the rendering process. Doctype for `'text/html'`
+        can be specified by setting the `html_doctype` attribute (default
+        is `XHTML_STRICT`)
 
         When `fragment` is specified, the (filtered) Genshi stream is
         returned.
+
+        When `iterable` is specified, the content as an iterable instance
+        which is generated from filtered Genshi stream is returned.
         """
         if content_type is None:
             content_type = 'text/html'
@@ -994,8 +1086,9 @@ class Chrome(Component):
             stream.render('text', out=buffer, encoding='utf-8')
             return buffer.getvalue()
 
-        doctype = {'text/html': Chrome.default_html_doctype}.get(content_type)
-        if doctype:
+        doctype = None
+        if content_type == 'text/html':
+            doctype = self.html_doctype
             if req.form_token:
                 stream |= self._add_form_token(req.form_token)
             if not int(req.session.get('accesskeys', 0)):
@@ -1004,14 +1097,17 @@ class Chrome(Component):
         links = req.chrome.get('links')
         scripts = req.chrome.get('scripts')
         script_data = req.chrome.get('script_data')
-        req.chrome['links'] = {}
-        req.chrome['scripts'] = []
-        req.chrome['script_data'] = {}
+        req.chrome.update({'early_links': links, 'early_scripts': scripts,
+                           'early_script_data': script_data,
+                           'links': {}, 'scripts': [], 'script_data': {}})
         data.setdefault('chrome', {}).update({
             'late_links': req.chrome['links'],
             'late_scripts': req.chrome['scripts'],
             'late_script_data': req.chrome['script_data'],
         })
+
+        if iterable:
+            return self.iterable_content(stream, method, doctype=doctype)
 
         try:
             buffer = StringIO()
@@ -1021,28 +1117,85 @@ class Chrome(Component):
                                                _invalid_control_chars)
         except Exception, e:
             # restore what may be needed by the error template
-            req.chrome['links'] = links
-            req.chrome['scripts'] = scripts
-            req.chrome['script_data'] = script_data
+            req.chrome.update({'early_links': None, 'early_scripts': None,
+                               'early_script_data': None, 'links': links,
+                               'scripts': scripts, 'script_data': script_data})
             # give some hints when hitting a Genshi unicode error
             if isinstance(e, UnicodeError):
                 pos = self._stream_location(stream)
                 if pos:
                     location = "'%s', line %s, char %s" % pos
                 else:
-                    location = _("(unknown template location)")
+                    location = '%s %s' % (filename,
+                                          _("(unknown template location)"))
                 raise TracError(_("Genshi %(error)s error while rendering "
                                   "template %(location)s",
                                   error=e.__class__.__name__,
                                   location=location))
             raise
 
+    def get_interface_customization_files(self):
+        """Returns a dictionary containing the lists of files present in the
+        site and shared templates and htdocs directories.
+        """
+        def list_dir(path, suffix=None):
+            if not os.path.isdir(path):
+                return []
+            return sorted(name for name in os.listdir(path)
+                               if suffix is None or name.endswith(suffix))
+
+        files = {}
+        # Collect templates list
+        site_templates = list_dir(self.env.templates_dir, '.html')
+        shared_templates = list_dir(Chrome(self.env).shared_templates_dir,
+                                    '.html')
+
+        # Collect static resources list
+        site_htdocs = list_dir(self.env.htdocs_dir)
+        shared_htdocs = list_dir(Chrome(self.env).shared_htdocs_dir)
+
+        if any((site_templates, shared_templates, site_htdocs, shared_htdocs)):
+            files = {
+                'site-templates': site_templates,
+                'shared-templates': shared_templates,
+                'site-htdocs': site_htdocs,
+                'shared-htdocs': shared_htdocs,
+            }
+        return files
+
+    def iterable_content(self, stream, method, **kwargs):
+        """Generate an iterable object which iterates `str` instances
+        from the given stream instance.
+
+        :param method: the serialization method; can be either "xml",
+                       "xhtml", "html", "text", or a custom serializer
+                       class
+        """
+        try:
+            if method == 'text':
+                for chunk in stream.serialize(method, **kwargs):
+                    yield chunk.encode('utf-8')
+            else:
+                for chunk in stream.serialize(method, **kwargs):
+                    yield chunk.encode('utf-8') \
+                               .translate(_translate_nop,
+                                          _invalid_control_chars)
+        except Exception, e:
+            pos = self._stream_location(stream)
+            if pos:
+                location = "'%s', line %s, char %s" % pos
+            else:
+                location = '(unknown template location)'
+            self.log.error('Genshi %s error while rendering template %s%s',
+                           e.__class__.__name__, location,
+                           exception_to_unicode(e, traceback=True))
+
     # E-mail formatting utilities
 
     def cc_list(self, cc_field):
         """Split a CC: value in a list of addresses."""
         ccs = []
-        for cc in re.split(r'[;,]', cc_field):
+        for cc in re.split(r'[;,]', cc_field or ''):
             cc = cc.strip()
             if cc:
                 ccs.append(cc)
@@ -1102,7 +1255,8 @@ class Chrome(Component):
 
     def add_wiki_toolbars(self, req):
         """Add wiki toolbars to `<textarea class="wikitext">` fields."""
-        add_script(req, 'common/js/wikitoolbar.js')
+        if self.wiki_toolbars:
+            add_script(req, 'common/js/wikitoolbar.js')
         self.add_textarea_grips(req)
 
     def add_auto_preview(self, req):
@@ -1120,17 +1274,28 @@ class Chrome(Component):
         add_script(req, 'common/js/jquery-ui-addons.js')
         add_stylesheet(req, 'common/css/jquery-ui-addons.css')
         is_iso8601 = req.lc_time == 'iso8601'
+        now = datetime_now(req.tz)
+        tzoffset = now.strftime('%z')
+        default_timezone = 'Z' if tzoffset == '+0000' else \
+                           tzoffset[:-2] + ':' + tzoffset[-2:]
+        if is_iso8601:
+            timezone_list = get_timezone_list_jquery_ui(now)
+        else:
+            # default timezone must be included
+            timezone_list = [default_timezone if default_timezone != 'Z' else
+                             {'value': 'Z', 'label': '+00:00'}]
         add_script_data(req, jquery_ui={
             'month_names': get_month_names_jquery_ui(req),
             'day_names': get_day_names_jquery_ui(req),
             'date_format': get_date_format_jquery_ui(req.lc_time),
             'time_format': get_time_format_jquery_ui(req.lc_time),
             'ampm': not is_24_hours(req.lc_time),
+            'period_names': get_period_names_jquery_ui(req),
             'first_week_day': get_first_week_day_jquery_ui(req),
-            'timepicker_separator': 'T' if is_iso8601 else ' ',
+            'timepicker_separator': get_timepicker_separator_jquery_ui(req),
             'show_timezone': is_iso8601,
-            'timezone_list': get_timezone_list_jquery_ui() \
-                             if is_iso8601 else [],
+            'default_timezone': default_timezone,
+            'timezone_list': timezone_list,
             'timezone_iso8601': is_iso8601,
         })
         add_script(req, 'common/js/jquery-ui-i18n.js')
@@ -1144,7 +1309,7 @@ class Chrome(Component):
         def _generate(stream, ctxt=None):
             for kind, data, pos in stream:
                 if kind is START and data[0].localname == 'form' \
-                                 and data[1].get('method', '').lower() == 'post':
+                        and data[1].get('method', '').lower() == 'post':
                     yield kind, data, pos
                     for event in elem.generate():
                         yield event
@@ -1170,4 +1335,3 @@ class Chrome(Component):
     def _stream_location(self, stream):
         for kind, data, pos in stream:
             return pos
-

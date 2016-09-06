@@ -18,13 +18,12 @@ import copy
 import re
 
 from genshi.builder import tag
-from genshi.core import Markup, unescape
 
 from trac.cache import cached
 from trac.config import *
 from trac.core import *
 from trac.perm import IPermissionRequestor, PermissionCache, PermissionSystem
-from trac.resource import IResourceManager, ResourceSystem
+from trac.resource import IResourceManager
 from trac.util import Ranges, as_int
 from trac.util.text import shorten_line
 from trac.util.translation import _, N_, gettext
@@ -41,9 +40,9 @@ class ITicketActionController(Interface):
 
     def get_ticket_actions(req, ticket):
         """Return an iterable of `(weight, action)` tuples corresponding to
-        the actions that are contributed by this component.
-        That list may vary given the current state of the ticket and the
-        actual request parameter.
+        the actions that are contributed by this component. The list is
+        dependent on the current state of the ticket and the actual request
+        parameter.
 
         `action` is a key used to identify that particular action.
         (note that 'history' and 'diff' are reserved and should not be used
@@ -53,7 +52,8 @@ class ITicketActionController(Interface):
         integer weight. The first action in the list is used as the default
         action.
 
-        When in doubt, use a weight of 0."""
+        When in doubt, use a weight of 0.
+        """
 
     def get_all_status():
         """Returns an iterable of all the possible values for the ''status''
@@ -123,6 +123,15 @@ class ITicketChangeListener(Interface):
     def ticket_deleted(ticket):
         """Called when a ticket is deleted."""
 
+    def ticket_comment_modified(ticket, cdate, author, comment, old_comment):
+        """Called when a ticket comment is modified."""
+
+    def ticket_change_deleted(ticket, cdate, changes):
+        """Called when a ticket change is deleted.
+
+        `changes` is a dictionary of tuple `(oldvalue, newvalue)`
+        containing the ticket change of the fields that have changed."""
+
 
 class ITicketManipulator(Interface):
     """Miscellaneous manipulation of ticket workflow features."""
@@ -157,51 +166,10 @@ class IMilestoneChangeListener(Interface):
     def milestone_deleted(milestone):
         """Called when a milestone is deleted."""
 
-class ITicketFieldProvider(Interface):
-    """Extension point interface for components that provide fields for the
-    ticket system."""
-
-    def get_select_fields():
-        """Returns a list of select fields, each as a tuple of
-        (rank, field)
-        where field is a dictionary that defines:
-            * name: the field name 
-            * pk: the primary key of the field table
-            * label: the label to display, preferably wrapped with N_()
-            * cls: the model describing the field
-        the following keys can also usefully be defined:
-            * optional: a boolean specifying that the select can be empty
-        
-        The rank is expected to be an integer to specify the sorting of the
-        select and radio fields. This is not intended to allow for the extent
-        of configurability of the custom fields but allows a plugin to mix in
-        fields as if they are a first class member of the ticket system.
-        """
-
-    def get_radio_fields():
-        """Returns a list of radio fields, each as a tuple of
-        (rank, field)
-        See the documentation for get_select_fields for descriptions of rank and
-        field.
-        Note that in contrast to get_select_fields, radio fields will all be
-        specified as optional.
-        """
-
-    def get_raw_fields():
-        """Returns a list of fields, each represents ticket field
-        dictionary. For example:
-            * name: field name
-            * type: field type
-            * label: the label to display, preferably wrapped with N_()
-            * format: field format
-            * other appropriate field properties
-        """
 
 class TicketSystem(Component):
-    implements(IPermissionRequestor, IWikiSyntaxProvider, IResourceManager,
-               ITicketFieldProvider)
+    implements(IPermissionRequestor, IWikiSyntaxProvider, IResourceManager)
 
-    ticket_field_providers = ExtensionPoint(ITicketFieldProvider)
     change_listeners = ExtensionPoint(ITicketChangeListener)
     milestone_change_listeners = ExtensionPoint(IMilestoneChangeListener)
 
@@ -264,8 +232,8 @@ class TicketSystem(Component):
         (''since 0.11'').""")
 
     def __init__(self):
-        self.log.debug('action controllers for ticket workflow: %r' %
-                [c.__class__.__name__ for c in self.action_controllers])
+        self.log.debug('action controllers for ticket workflow: %r',
+                       [c.__class__.__name__ for c in self.action_controllers])
 
     # Public API
 
@@ -332,41 +300,36 @@ class TicketSystem(Component):
 
         # Owner field, by default text but can be changed dynamically
         # into a drop-down depending on configuration (restrict_owner=true)
-        field = {'name': 'owner', 'label': N_('Owner')}
-        field['type'] = 'text'
-        fields.append(field)
+        fields.append({'name': 'owner', 'type': 'text',
+                       'label': N_('Owner')})
 
         # Description
         fields.append({'name': 'description', 'type': 'textarea',
                        'label': N_('Description')})
 
         # Default select and radio fields
-        selects = []
-        [selects.extend(field_provider.get_select_fields()) 
-                    for field_provider in self.ticket_field_providers]
-        [select.update({'type': 'select'}) for n, select in selects]
-        radios = []
-        [radios.extend(field_provider.get_radio_fields()) 
-                    for field_provider in self.ticket_field_providers]
-        [radio.update({'type': 'radio',
-                       'optional': True}) for n, radio in radios]
-
-        selects.extend(radios)
-        selects.sort()
-        for rank, field in selects:
-            cls = field['cls']
-            name = field['name']
-            pk_field = field.get('pk', 'name')
-            options = [getattr(val, pk_field)
-                       for val in cls.select(self.env, db=db)]
-
+        selects = [('type', N_('Type'), model.Type),
+                   ('status', N_('Status'), model.Status),
+                   ('priority', N_('Priority'), model.Priority),
+                   ('milestone', N_('Milestone'), model.Milestone),
+                   ('component', N_('Component'), model.Component),
+                   ('version', N_('Version'), model.Version),
+                   ('severity', N_('Severity'), model.Severity),
+                   ('resolution', N_('Resolution'), model.Resolution)]
+        for name, label, cls in selects:
+            options = [val.name for val in cls.select(self.env, db=db)]
             if not options:
                 # Fields without possible values are treated as if they didn't
                 # exist
                 continue
-            if 'value' not in field:
-                field['value'] = getattr(self, 'default_' + name, '')
-            field['options'] = options
+            field = {'name': name, 'type': 'select', 'label': label,
+                     'value': getattr(self, 'default_' + name, ''),
+                     'options': options}
+            if name in ('status', 'resolution'):
+                field['type'] = 'radio'
+                field['optional'] = True
+            elif name in ('milestone', 'version'):
+                field['optional'] = True
             fields.append(field)
 
         # Advanced text fields
@@ -397,32 +360,11 @@ class TicketSystem(Component):
             field['custom'] = True
             fields.append(field)
 
-        #TODO: this is Bloodhound specific patch to the Trac. Contact Trac
-        # community about possibility to apply the change to the Trac codebase
-        self._add_raw_fields_from_field_providers(fields)
-
         return fields
 
     reserved_field_names = ['report', 'order', 'desc', 'group', 'groupdesc',
                             'col', 'row', 'format', 'max', 'page', 'verbose',
                             'comment', 'or']
-
-    def _add_raw_fields_from_field_providers(self, fields):
-        for field_provider in self.ticket_field_providers:
-            if hasattr(field_provider, 'get_raw_fields'):
-                raw_fields = field_provider.get_raw_fields()
-                if raw_fields:
-                    for raw_field in raw_fields:
-                        self._add_raw_field(
-                            raw_field, fields)
-
-    def _add_raw_field(self, raw_field, fields):
-        if raw_field["name"] in [f['name'] for f in fields]:
-            self.log.warning(
-                'Duplicate field name "%s" (ignoring)', raw_field["name"])
-        else:
-            fields.append(raw_field)
-
 
     def get_custom_fields(self):
         return copy.deepcopy(self.custom_fields)
@@ -470,30 +412,43 @@ class TicketSystem(Component):
         """
         if self.restrict_owner:
             field['type'] = 'select'
-            possible_owners = []
+            allowed_owners = self.get_allowed_owners(ticket)
+            allowed_owners.insert(0, '< default >')
+            field['options'] = allowed_owners
+            field['optional'] = True
+
+    def get_allowed_owners(self, ticket=None):
+        """Returns a list of permitted ticket owners (those possessing the
+        TICKET_MODIFY permission). Returns `None` if the option `[ticket]`
+        `restrict_owner` is `False`.
+
+        If `ticket` is not `None`, fine-grained permission checks are used
+        to determine the allowed owners for the specified resource.
+
+        :since: 1.0.3
+        """
+        if self.restrict_owner:
+            allowed_owners = []
             for user in PermissionSystem(self.env) \
-                    .get_users_with_permission('TICKET_MODIFY'):
+                        .get_users_with_permission('TICKET_MODIFY'):
                 if not ticket or \
                         'TICKET_MODIFY' in PermissionCache(self.env, user,
                                                            ticket.resource):
-                    possible_owners.append(user)
-            possible_owners.sort()
-            possible_owners.insert(0, '< default >')
-            field['options'] = possible_owners
-            field['optional'] = True
+                    allowed_owners.append(user)
+            allowed_owners.sort()
+            return allowed_owners
 
     # IPermissionRequestor methods
 
     def get_permission_actions(self):
         return ['TICKET_APPEND', 'TICKET_CREATE', 'TICKET_CHGPROP',
                 'TICKET_VIEW', 'TICKET_EDIT_CC', 'TICKET_EDIT_DESCRIPTION',
-                'TICKET_EDIT_COMMENT', 'TICKET_BATCH_MODIFY',
+                'TICKET_EDIT_COMMENT',
                 ('TICKET_MODIFY', ['TICKET_APPEND', 'TICKET_CHGPROP']),
                 ('TICKET_ADMIN', ['TICKET_CREATE', 'TICKET_MODIFY',
                                   'TICKET_VIEW', 'TICKET_EDIT_CC',
                                   'TICKET_EDIT_DESCRIPTION',
-                                  'TICKET_EDIT_COMMENT',
-                                  'TICKET_BATCH_MODIFY'])]
+                                  'TICKET_EDIT_COMMENT'])]
 
     # IWikiSyntaxProvider methods
 
@@ -541,11 +496,7 @@ class TicketSystem(Component):
                 ranges = str(r)
                 if params:
                     params = '&' + params[1:]
-                if isinstance(label, Markup):
-                    _label = unescape(label)
-                else:
-                    _label = label
-                label_wrap = _label.replace(',', u',\u200b')
+                label_wrap = label.replace(',', u',\u200b')
                 ranges_wrap = ranges.replace(',', u', ')
                 return tag.a(label_wrap,
                              title=_("Tickets %(ranges)s", ranges=ranges_wrap),
@@ -562,24 +513,44 @@ class TicketSystem(Component):
                 cnum, realm, id = elts
                 if cnum != 'description' and cnum and not cnum[0].isdigit():
                     realm, id, cnum = elts # support old comment: style
+                id = as_int(id, None)
                 resource = formatter.resource(realm, id)
         else:
             resource = formatter.resource
             cnum = target
 
-        if resource and resource.realm == 'ticket':
-            id = as_int(resource.id, None)
-            if id is not None:
-                href = "%s#comment:%s" % (formatter.href.ticket(resource.id),
-                                          cnum)
-                title = _("Comment %(cnum)s for Ticket #%(id)s", cnum=cnum,
-                          id=resource.id)
-                if 'TICKET_VIEW' in formatter.perm(resource):
-                    for status, in self.env.db_query(
-                            "SELECT status FROM ticket WHERE id=%s", (id,)):
-                        return tag.a(label, href=href, title=title,
-                                     class_=status)
-                return tag.a(label, href=href, title=title)
+        if resource and resource.id and resource.realm == 'ticket' and \
+                cnum and (cnum.isdigit() or cnum == 'description'):
+            href = title = class_ = None
+            if self.resource_exists(resource):
+                from trac.ticket.model import Ticket
+                ticket = Ticket(self.env, resource.id)
+                if cnum != 'description' and not ticket.get_change(cnum):
+                    title = _("ticket comment does not exist")
+                    class_ = 'missing ticket'
+                elif 'TICKET_VIEW' in formatter.perm(resource):
+                    href = formatter.href.ticket(resource.id) + \
+                           "#comment:%s" % cnum
+                    if resource.id != formatter.resource.id:
+                        if cnum == 'description':
+                            title = _("Description for Ticket #%(id)s",
+                                      id=resource.id)
+                        else:
+                            title = _("Comment %(cnum)s for Ticket #%(id)s",
+                                      cnum=cnum, id=resource.id)
+                        class_ = ticket['status'] + ' ticket'
+                    else:
+                        title = _("Description") if cnum == 'description' \
+                                                 else _("Comment %(cnum)s",
+                                                        cnum=cnum)
+                        class_ = 'ticket'
+                else:
+                    title = _("no permission to view ticket")
+                    class_ = 'forbidden ticket'
+            else:
+                title = _("ticket does not exist")
+                class_ = 'missing ticket'
+            return tag.a(label, class_=class_, href=href, title=title)
         return label
 
     # IResourceManager methods
@@ -589,17 +560,15 @@ class TicketSystem(Component):
 
     def get_resource_description(self, resource, format=None, context=None,
                                  **kwargs):
-        nbhprefix = ResourceSystem(self.env).neighborhood_prefix(
-                resource.neighborhood)
         if format == 'compact':
-            return '%s#%s' % (nbhprefix, resource.id)
+            return '#%s' % resource.id
         elif format == 'summary':
             from trac.ticket.model import Ticket
             ticket = Ticket(self.env, resource.id)
             args = [ticket[f] for f in ('summary', 'status', 'resolution',
                                         'type')]
             return self.format_summary(*args)
-        return nbhprefix + _("Ticket #%(shortname)s", shortname=resource.id)
+        return _("Ticket #%(shortname)s", shortname=resource.id)
 
     def format_summary(self, summary, status=None, resolution=None, type=None):
         summary = shorten_line(summary)
@@ -628,41 +597,16 @@ class TicketSystem(Component):
         >>> resource_exists(env, t.resource)
         True
         """
-        if self.env.db_query("SELECT id FROM ticket WHERE id=%s",
-                             (resource.id,)):
+        try:
+            id_ = int(resource.id)
+        except (TypeError, ValueError):
+            return False
+        if self.env.db_query("SELECT id FROM ticket WHERE id=%s", (id_,)):
             if resource.version is None:
                 return True
             revcount = self.env.db_query("""
                 SELECT count(DISTINCT time) FROM ticket_change WHERE ticket=%s
-                """, (resource.id,))
+                """, (id_,))
             return revcount[0][0] >= resource.version
         else:
             return False
-
-    # ITicketFieldProvider methods
-
-    def get_select_fields(self):
-        """Default select and radio fields"""
-        from trac.ticket import model
-        selects = [(10, {'name': 'type', 'label': N_('Type'), 
-                         'cls': model.Type}),
-                   (30, {'name':'priority', 'label': N_('Priority'), 
-                         'cls': model.Priority}),
-                   (40, {'name': 'milestone', 'label': N_('Milestone'), 
-                         'cls': model.Milestone, 'optional': True}),
-                   (50, {'name': 'component', 'label': N_('Component'), 
-                         'cls': model.Component}),
-                   (60, {'name': 'version', 'label': N_('Version'), 
-                         'cls': model.Version, 'optional': True}),
-                   (70, {'name': 'severity', 'label': N_('Severity'), 
-                         'cls': model.Severity})]
-        return selects
-
-    def get_radio_fields(self):
-        """Default radio fields"""
-        from trac.ticket import model
-        radios = [(20, {'name': 'status', 'label': N_('Status'),
-                        'cls': model.Status}),
-                  (80, {'name': 'resolution', 'label': N_('Resolution'), 
-                        'cls': model.Resolution})]
-        return radios

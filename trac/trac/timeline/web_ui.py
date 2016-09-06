@@ -28,15 +28,15 @@ from trac.core import *
 from trac.perm import IPermissionRequestor
 from trac.timeline.api import ITimelineEventProvider
 from trac.util import as_int
-from trac.util.datefmt import format_date, format_datetime, format_time, \
-                              parse_date, to_utimestamp, to_datetime, utc, \
-                              pretty_timedelta, user_time
+from trac.util.datefmt import (datetime_now, format_date, format_datetime,
+                               format_time, parse_date, to_utimestamp,
+                               to_datetime, utc, pretty_timedelta, user_time)
 from trac.util.text import exception_to_unicode, to_unicode
 from trac.util.translation import _, tag_
 from trac.web import IRequestHandler, IRequestFilter
 from trac.web.chrome import (Chrome, INavigationContributor, ITemplateProvider,
-                             add_link, add_stylesheet, auth_link, prevnext_nav,
-                             web_context)
+                             add_link, add_stylesheet, add_warning, auth_link,
+                             prevnext_nav, web_context)
 from trac.wiki.api import IWikiSyntaxProvider
 from trac.wiki.formatter import concat_path_query_fragment, \
                                 split_url_into_path_query_fragment
@@ -90,8 +90,9 @@ class TimelineModule(Component):
     def process_request(self, req):
         req.perm.assert_permission('TIMELINE_VIEW')
 
-        format = req.args.get('format')
-        maxrows = int(req.args.get('max', 50 if format == 'rss' else 0))
+        format = req.args.getfirst('format')
+        default_maxrows = 50 if format == 'rss' else 0
+        maxrows = as_int(req.args.getfirst('max'), default_maxrows)
         lastvisit = int(req.session.get('timeline.lastvisit', '0'))
 
         # indication of new events is unchanged when form is updated by user
@@ -103,17 +104,21 @@ class TimelineModule(Component):
 
         # Parse the from date and adjust the timestamp to the last second of
         # the day
-        fromdate = today = datetime.now(req.tz)
+        fromdate = today = datetime_now(req.tz)
         yesterday = to_datetime(today.replace(tzinfo=None) - timedelta(days=1),
                                 req.tz)
         precisedate = precision = None
         if 'from' in req.args:
             # Acquire from date only from non-blank input
-            reqfromdate = req.args['from'].strip()
+            reqfromdate = req.args.getfirst('from').strip()
             if reqfromdate:
-                precisedate = user_time(req, parse_date, reqfromdate)
-                fromdate = precisedate.astimezone(req.tz)
-            precision = req.args.get('precision', '')
+                try:
+                    precisedate = user_time(req, parse_date, reqfromdate)
+                except TracError, e:
+                    add_warning(req, e)
+                else:
+                    fromdate = precisedate.astimezone(req.tz)
+            precision = req.args.getfirst('precision', '')
             if precision.startswith('second'):
                 precision = timedelta(seconds=1)
             elif precision.startswith('minute'):
@@ -126,7 +131,7 @@ class TimelineModule(Component):
                                         fromdate.day, 23, 59, 59, 999999),
                                req.tz)
 
-        daysback = as_int(req.args.get('daysback'),
+        daysback = as_int(req.args.getfirst('daysback'),
                           90 if format == 'rss' else None)
         if daysback is None:
             daysback = as_int(req.session.get('timeline.daysback'), None)
@@ -136,7 +141,7 @@ class TimelineModule(Component):
         if self.max_daysback >= 0:
             daysback = min(self.max_daysback, daysback)
 
-        authors = req.args.get('authors')
+        authors = req.args.getfirst('authors')
         if authors is None and format != 'rss':
             authors = req.session.get('timeline.authors')
         authors = (authors or '').strip()
@@ -164,17 +169,16 @@ class TimelineModule(Component):
 
         # save the results of submitting the timeline form to the session
         if 'update' in req.args:
-            for filter in available_filters:
-                key = 'timeline.filter.%s' % filter[0]
-                if filter[0] in req.args:
+            for filter_ in available_filters:
+                key = 'timeline.filter.%s' % filter_[0]
+                if filter_[0] in req.args:
                     req.session[key] = '1'
                 elif key in req.session:
                     del req.session[key]
 
         stop = fromdate
-        start = to_datetime(stop.replace(tzinfo=None) - \
-                                timedelta(days=daysback + 1),
-                            req.tz)
+        start = to_datetime(stop.replace(tzinfo=None) -
+                            timedelta(days=daysback + 1), req.tz)
 
         # create author include and exclude sets
         include = set()
@@ -195,9 +199,9 @@ class TimelineModule(Component):
                     # Check for 0.10 events
                     author = (event[2 if len(event) < 6 else 4] or '').lower()
                     if (not include or author in include) \
-                       and not author in exclude:
+                            and author not in exclude:
                         events.append(self._event_data(provider, event))
-            except Exception, e: # cope with a failure of that provider
+            except Exception, e:  # cope with a failure of that provider
                 self._provider_failure(e, req, provider, filters,
                                        [f[0] for f in available_filters])
 
@@ -242,23 +246,23 @@ class TimelineModule(Component):
 
         # Navigation to the previous/next period of 'daysback' days
         previous_start = fromdate.replace(tzinfo=None) - \
-                            timedelta(days=daysback + 1)
-        previous_start = format_date(to_datetime(previous_start, req.tz),
-                                     format='%Y-%m-%d', tzinfo=req.tz)
+                         timedelta(days=daysback + 1)
+        previous_start = format_date(previous_start, format='iso8601',
+                                     tzinfo=req.tz)
         add_link(req, 'prev', req.href.timeline(from_=previous_start,
                                                 authors=authors,
                                                 daysback=daysback),
-                 _('Previous Period'))
+                 _("Previous Period"))
         if today - fromdate > timedelta(days=0):
             next_start = fromdate.replace(tzinfo=None) + \
-                            timedelta(days=daysback + 1)
+                         timedelta(days=daysback + 1)
             next_start = format_date(to_datetime(next_start, req.tz),
-                                     format='%Y-%m-%d', tzinfo=req.tz)
+                                     format='iso8601', tzinfo=req.tz)
             add_link(req, 'next', req.href.timeline(from_=next_start,
                                                     authors=authors,
                                                     daysback=daysback),
-                     _('Next Period'))
-        prevnext_nav(req, _('Previous Period'), _('Next Period'))
+                     _("Next Period"))
+        prevnext_nav(req, _("Previous Period"), _("Next Period"))
 
         return 'timeline.html', data, None
 
@@ -326,13 +330,13 @@ class TimelineModule(Component):
                 elif len(time) >= 2:
                     precision = 'hours'
             try:
-                return self.get_timeline_link(formatter.req,
-                                              parse_date(path, utc),
-                                              label, precision, query, fragment)
+                dt = parse_date(path, utc, locale='iso8601', hint='iso8601')
+                return self.get_timeline_link(formatter.req, dt, label,
+                                              precision, query, fragment)
             except TracError, e:
-                return tag.a(label, title=to_unicode(e.message),
+                return tag.a(label, title=to_unicode(e),
                              class_='timeline missing')
-        yield ('timeline', link_resolver)
+        yield 'timeline', link_resolver
 
     # Public methods
 
@@ -374,7 +378,7 @@ class TimelineModule(Component):
         At the same time, the message will contain a link to the timeline
         without the filters corresponding to the guilty event provider `ep`.
         """
-        self.log.error('Timeline event provider failed: %s',
+        self.log.error("Timeline event provider failed: %s",
                        exception_to_unicode(exc, traceback=True))
 
         ep_kinds = dict((f[0], f[1])
@@ -383,9 +387,9 @@ class TimelineModule(Component):
         current_filters = set(current_filters)
         other_filters = set(current_filters) - ep_filters
         if not other_filters:
-            other_filters = set(all_filters) -  ep_filters
-        args = [(a, req.args.get(a)) for a in ('from', 'format', 'max',
-                                               'daysback')]
+            other_filters = set(all_filters) - ep_filters
+        args = [(a, req.args.get(a))
+                for a in ('from', 'format', 'max', 'daysback')]
         href = req.href.timeline(args + [(f, 'on') for f in other_filters])
         # TRANSLATOR: ...want to see the 'other kinds of events' from... (link)
         other_events = tag.a(_('other kinds of events'), href=href)
@@ -395,7 +399,7 @@ class TimelineModule(Component):
                        name=tag.tt(ep.__class__.__name__),
                        kinds=', '.join('"%s"' % ep_kinds[f] for f in
                                        current_filters & ep_filters)),
-                  tag.b(exception_to_unicode(exc)), class_='message'),
+                  tag.strong(exception_to_unicode(exc)), class_='message'),
             tag.p(tag_("You may want to see the %(other_events)s from the "
                        "Timeline or notify your Trac administrator about the "
                        "error (detailed information was written to the log).",

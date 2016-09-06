@@ -1,11 +1,29 @@
-from trac.perm import PermissionCache
-from trac.test import Mock, EnvironmentStub
-from trac.ticket import api, default_workflow, web_ui
-from trac.ticket.batch import BatchModifyModule
-from trac.ticket.model import Ticket
-from trac.util.datefmt import utc
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2012-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
+
+from __future__ import with_statement
 
 import unittest
+from datetime import timedelta
+
+from trac.perm import DefaultPermissionPolicy, DefaultPermissionStore,\
+                      PermissionCache
+from trac.test import EnvironmentStub, MockRequest
+from trac.ticket import default_workflow, web_ui
+from trac.ticket.batch import BatchModifyModule
+from trac.ticket.model import Ticket
+from trac.util.datefmt import datetime_now, utc
+from trac.web.chrome import web_context
 
 
 class BatchModifyTestCase(unittest.TestCase):
@@ -13,9 +31,11 @@ class BatchModifyTestCase(unittest.TestCase):
     def setUp(self):
         self.env = EnvironmentStub(default_data=True,
             enable=[default_workflow.ConfigurableTicketWorkflow,
-                    web_ui.TicketModule, 
-                    api.TicketSystem])
-        self.req = Mock(href=self.env.href, authname='anonymous', tz=utc)
+                    DefaultPermissionPolicy, DefaultPermissionStore,
+                    web_ui.TicketModule])
+        self.env.config.set('trac', 'permission_policies',
+                            'DefaultPermissionPolicy')
+        self.req = MockRequest(self.env)
         self.req.session = {}
         self.req.perm = PermissionCache(self.env)
 
@@ -220,8 +240,6 @@ class BatchModifyTestCase(unittest.TestCase):
         batch._save_ticket_changes(self.req, selected_tickets, {}, '',
                                    'embiggen')
 
-        ticket = Ticket(self.env, int(first_ticket_id))
-        changes = ticket.get_changelog()
         self.assertFieldChanged(first_ticket_id, 'status', 'big')
         self.assertFieldChanged(second_ticket_id, 'status', 'big')
 
@@ -242,15 +260,60 @@ class BatchModifyTestCase(unittest.TestCase):
         batch._save_ticket_changes(self.req, selected_tickets, {}, '',
                                    'buckify')
 
-        ticket = Ticket(self.env, int(first_ticket_id))
-        changes = ticket.get_changelog()
         self.assertFieldChanged(first_ticket_id, 'owner', 'buck')
         self.assertFieldChanged(second_ticket_id, 'owner', 'buck')
+
+    def test_timeline_events(self):
+        """Regression test for #11288"""
+        tktmod = web_ui.TicketModule(self.env)
+        now = datetime_now(utc)
+        start = now - timedelta(hours=1)
+        stop = now + timedelta(hours=1)
+        events = tktmod.get_timeline_events(self.req, start, stop,
+                                            ['ticket_details'])
+        self.assertEqual(True, all(ev[0] != 'batchmodify' for ev in events))
+
+        prio_ids = {}
+        for i in xrange(20):
+            t = Ticket(self.env)
+            t['summary'] = 'Ticket %d' % i
+            t['priority'] = ('', 'minor', 'major', 'critical')[i % 4]
+            tktid = t.insert()
+            prio_ids.setdefault(t['priority'], []).append(tktid)
+        tktids = prio_ids['critical'] + prio_ids['major'] + \
+                 prio_ids['minor'] + prio_ids['']
+
+        new_values = {'summary': 'batch updated ticket',
+                      'owner': 'ticket11288', 'reporter': 'ticket11288'}
+        batch = BatchModifyModule(self.env)
+        batch._save_ticket_changes(self.req, tktids, new_values, '', 'leave')
+        # shuffle ticket_change records
+        with self.env.db_transaction as db:
+            rows = db('SELECT * FROM ticket_change')
+            db.execute('DELETE FROM ticket_change')
+            rows = rows[0::4] + rows[1::4] + rows[2::4] + rows[3::4]
+            db.executemany('INSERT INTO ticket_change VALUES (%s)' %
+                           ','.join(('%s',) * len(rows[0])),
+                           rows)
+
+        events = tktmod.get_timeline_events(self.req, start, stop,
+                                            ['ticket_details'])
+        events = [ev for ev in events if ev[0] == 'batchmodify']
+        self.assertEqual(1, len(events))
+        batch_ev = events[0]
+        self.assertEqual('anonymous', batch_ev[2])
+        self.assertEqual(tktids, batch_ev[3][0])
+        self.assertEqual('updated', batch_ev[3][1])
+
+        context = web_context(self.req)
+        self.assertEqual(
+            self.req.href.query(id=','.join(str(t) for t in tktids)),
+            tktmod.render_timeline_event(context, 'url', batch_ev))
 
 
 def suite():
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(BatchModifyTestCase, 'test'))
+    suite.addTest(unittest.makeSuite(BatchModifyTestCase))
     return suite
 
 if __name__ == '__main__':

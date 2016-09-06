@@ -17,12 +17,12 @@
 
 from __future__ import with_statement
 
-import csv
+from cStringIO import StringIO
+from datetime import datetime, timedelta
 from itertools import groupby
 from math import ceil
-from datetime import datetime, timedelta
+import csv
 import re
-from StringIO import StringIO
 
 from genshi.builder import tag
 
@@ -32,14 +32,14 @@ from trac.db import get_column_names
 from trac.mimeview.api import IContentConverter, Mimeview
 from trac.resource import Resource
 from trac.ticket.api import TicketSystem
-from trac.ticket.model import Milestone, group_milestones, Ticket
+from trac.ticket.model import Milestone, group_milestones
 from trac.util import Ranges, as_bool
-from trac.util.datefmt import format_date, format_datetime, from_utimestamp, \
+from trac.util.datefmt import datetime_now, format_datetime, from_utimestamp, \
                               parse_date, to_timestamp, to_utimestamp, utc, \
                               user_time
 from trac.util.presentation import Paginator
 from trac.util.text import empty, shorten_line, quote_query_string
-from trac.util.translation import _, tag_, cleandoc_
+from trac.util.translation import _, tag_, cleandoc_, ngettext
 from trac.web import arg_list_to_args, parse_arg_list, IRequestHandler
 from trac.web.href import Href
 from trac.web.chrome import (INavigationContributor, Chrome,
@@ -47,6 +47,7 @@ from trac.web.chrome import (INavigationContributor, Chrome,
                              add_script_data, add_stylesheet, add_warning,
                              web_context)
 from trac.wiki.api import IWikiSyntaxProvider
+from trac.wiki.formatter import system_message
 from trac.wiki.macros import WikiMacroBase # TODO: should be moved in .api
 
 
@@ -314,7 +315,6 @@ class Query(object):
                     raise TracError(_("Page %(page)s is beyond the number of "
                                       "pages in the query", page=self.page))
 
-            # self.env.log.debug("SQL: " + sql % tuple([repr(a) for a in args]))
             cursor.execute(sql, args)
             columns = get_column_names(cursor)
             fields = []
@@ -337,10 +337,7 @@ class Query(object):
                     elif name in self.time_fields:
                         val = from_utimestamp(val)
                     elif field and field['type'] == 'checkbox':
-                        try:
-                            val = bool(int(val))
-                        except (TypeError, ValueError):
-                            val = False
+                        val = as_bool(val)
                     elif val is None:
                         val = ''
                     result[name] = val
@@ -432,13 +429,13 @@ class Query(object):
         self.get_columns()
         db = self.env.get_read_db()
 
-        enum_columns = ('resolution', 'priority', 'severity')
         # Build the list of actual columns to query
-        cols = self.cols[:]
+        cols = []
         def add_cols(*args):
             for col in args:
                 if not col in cols:
                     cols.append(col)
+        add_cols(*self.cols)  # remove duplicated cols
         if self.group and not self.group in cols:
             add_cols(self.group)
         if self.rows:
@@ -446,37 +443,59 @@ class Query(object):
         add_cols('status', 'priority', 'time', 'changetime', self.order)
         cols.extend([c for c in self.constraint_cols if not c in cols])
 
-        custom_fields = [f['name'] for f in self.fields if f.get('custom')]
-        list_fields = [f['name'] for f in self.fields
-                                 if f['type'] == 'text' and
-                                    f.get('format') == 'list']
+        custom_fields = set(f['name'] for f in self.fields if f.get('custom'))
+        list_fields = set(f['name'] for f in self.fields
+                                    if f['type'] == 'text' and
+                                       f.get('format') == 'list')
+        enum_columns = [col for col in ('resolution', 'priority', 'severity',
+                                        'type')
+                            if col not in custom_fields and
+                               col in ('priority', self.order, self.group)]
+        joined_columns = [col for col in ('milestone', 'version')
+                              if col not in custom_fields and
+                                 col in (self.order, self.group)]
+        # 31 is max of joins in SQLite 32-bit
+        use_joins = (len(set(cols) & custom_fields) +
+                     len(enum_columns) + len(joined_columns)) <= 31
 
         sql = []
-        sql.append("SELECT " + ",".join(['t.%s AS %s' % (c, c) for c in cols
-                                         if c not in custom_fields]))
-        sql.append(",priority.value AS priority_value")
-        for k in [db.quote(k) for k in cols if k in custom_fields]:
-            sql.append(",%s.value AS %s" % (k, k))
-        sql.append("\nFROM ticket AS t")
+        sql.append("SELECT " + ",".join('t.%s AS %s' % (c, c) for c in cols
+                                        if c not in custom_fields))
+        if 'priority' in enum_columns:
+            sql.append(",priority.value AS priority_value")
 
-        # Join with ticket_custom table as necessary
-        for k in [k for k in cols if k in custom_fields]:
-            qk = db.quote(k)
-            sql.append("\n  LEFT OUTER JOIN ticket_custom AS %s ON " \
-                       "(id=%s.ticket AND %s.name='%s')" % (qk, qk, qk, k))
+        if use_joins:
+            # Use LEFT OUTER JOIN for ticket_custom table
+            sql.extend(",%s.value AS %s" % ((db.quote(k),) * 2)
+                       for k in cols if k in custom_fields)
+            sql.append("\nFROM ticket AS t")
+            sql.extend("\n  LEFT OUTER JOIN ticket_custom AS %(qk)s ON "
+                       "(%(qk)s.ticket=t.id AND %(qk)s.name='%(k)s')"
+                        % {'qk': db.quote(k), 'k': k}
+                        for k in cols if k in custom_fields)
+        else:
+            # Use subquery for ticket_custom table
+            sql.extend(",%s AS %s" % ((db.quote(k),) * 2)
+                       for k in cols if k in custom_fields)
+            sql.append('\nFROM (\n  SELECT ')
+            sql.append(','.join('t.%s AS %s' % (c, c)
+                                for c in cols if c not in custom_fields))
+            sql.extend(",\n  (SELECT c.value FROM ticket_custom c "
+                       "WHERE c.ticket=t.id AND c.name='%s') AS %s"
+                       % (k, db.quote(k))
+                       for k in cols if k in custom_fields)
+            sql.append("\n  FROM ticket AS t) AS t")
 
         # Join with the enum table for proper sorting
-        for col in [c for c in enum_columns
-                    if c == self.order or c == self.group or c == 'priority']:
-            sql.append("\n  LEFT OUTER JOIN enum AS %s ON "
-                       "(%s.type='%s' AND %s.name=%s)"
-                       % (col, col, col, col, col))
+        sql.extend("\n  LEFT OUTER JOIN enum AS %(col)s ON "
+                   "(%(col)s.type='%(type)s' AND %(col)s.name=t.%(col)s)" %
+                   {'col': col,
+                    'type': 'ticket_type' if col == 'type' else col}
+                   for col in enum_columns)
 
         # Join with the version/milestone tables for proper sorting
-        for col in [c for c in ['milestone', 'version']
-                    if c == self.order or c == self.group]:
-            sql.append("\n  LEFT OUTER JOIN %s ON (%s.name=%s)"
-                       % (col, col, col))
+        sql.extend("\n  LEFT OUTER JOIN %(col)s ON (%(col)s.name=%(col)s)"
+                   % {'col': col} for col in joined_columns)
 
         def get_timestamp(date):
             if date:
@@ -489,8 +508,10 @@ class Query(object):
         def get_constraint_sql(name, value, mode, neg):
             if name not in custom_fields:
                 col = 't.' + name
+            elif use_joins:
+                col = db.quote(name) + '.value'
             else:
-                col = '%s.value' % db.quote(name)
+                col = 't.' + db.quote(name)
             value = value[len(mode) + neg:]
 
             if name in self.time_fields:
@@ -579,11 +600,11 @@ class Query(object):
                         if a == b:
                             ids.append(str(a))
                         else:
-                            id_clauses.append('id BETWEEN %s AND %s')
+                            id_clauses.append('t.id BETWEEN %s AND %s')
                             args.append(a)
                             args.append(b)
                     if ids:
-                        id_clauses.append('id IN (%s)' % (','.join(ids)))
+                        id_clauses.append('t.id IN (%s)' % (','.join(ids)))
                     if id_clauses:
                         clauses.append('%s(%s)' % ('NOT 'if neg else '',
                                                    ' OR '.join(id_clauses)))
@@ -591,8 +612,10 @@ class Query(object):
                 elif not mode and len(v) > 1 and k not in self.time_fields:
                     if k not in custom_fields:
                         col = 't.' + k
+                    elif use_joins:
+                        col = db.quote(k) + '.value'
                     else:
-                        col = '%s.value' % db.quote(k)
+                        col = 't.' + db.quote(k)
                     clauses.append("COALESCE(%s,'') %sIN (%s)"
                                    % (col, 'NOT ' if neg else '',
                                       ','.join(['%s' for val in v])))
@@ -632,10 +655,12 @@ class Query(object):
         for name, desc in order_cols:
             if name in enum_columns:
                 col = name + '.value'
-            elif name in custom_fields:
-                col = '%s.value' % db.quote(name)
-            else:
+            elif name not in custom_fields:
                 col = 't.' + name
+            elif use_joins:
+                col = db.quote(name) + '.value'
+            else:
+                col = 't.' + db.quote(name)
             desc = ' DESC' if desc else ''
             # FIXME: This is a somewhat ugly hack.  Can we also have the
             #        column type for this?  If it's an integer, we do first
@@ -647,12 +672,12 @@ class Query(object):
             if name in enum_columns:
                 # These values must be compared as ints, not as strings
                 sql.append(db.cast(col, 'int') + desc)
-            elif name == 'milestone':
+            elif name == 'milestone' and name not in custom_fields:
                 sql.append("COALESCE(milestone.completed,0)=0%s,"
                            "milestone.completed%s,"
                            "COALESCE(milestone.due,0)=0%s,milestone.due%s,"
                            "%s%s" % (desc, desc, desc, desc, col, desc))
-            elif name == 'version':
+            elif name == 'version' and name not in custom_fields:
                 sql.append("COALESCE(version.time,0)=0%s,version.time%s,%s%s"
                            % (desc, desc, col, desc))
             else:
@@ -716,11 +741,17 @@ class Query(object):
         cols = self.get_columns()
         labels = TicketSystem(self.env).get_ticket_field_labels()
         wikify = set(f['name'] for f in self.fields
-                     if f['type'] == 'text' and f.get('format') == 'wiki')
+                     if f['type'] == 'text' and
+                        f.get('format') == 'wiki')
+        wikifyblock = set(f['name'] for f in self.fields
+                          if f['type'] == 'textarea' and
+                             f.get('format') == 'wiki')
+        wikifyblock.add('description')
 
         headers = [{
             'name': col, 'label': labels.get(col, _('Ticket')),
             'wikify': col in wikify,
+            'wikifyblock': col in wikifyblock,
             'href': self.get_href(context.href, order=col,
                                   desc=(col == self.order and not self.desc))
         } for col in cols]
@@ -756,9 +787,6 @@ class Query(object):
                     ticket['changed'] = True
             if self.group:
                 group_key = ticket[self.group]
-                # If grouping by datetime field use days (Bloodhound #68)
-                if self.group in ('changetime', 'time'):
-                    group_key = format_date(group_key)
                 groups.setdefault(group_key, []).append(ticket)
                 if not groupsequence or group_key not in groupsequence:
                     groupsequence.append(group_key)
@@ -857,12 +885,12 @@ class QueryModule(Component):
 
     def convert_content(self, req, mimetype, query, key):
         if key == 'rss':
-            return self.export_rss(req, query)
+            return self._export_rss(req, query)
         elif key == 'csv':
-            return self.export_csv(req, query, mimetype='text/csv')
+            return self._export_csv(req, query, mimetype='text/csv')
         elif key == 'tab':
-            return self.export_csv(req, query, '\t',
-                                   mimetype='text/tab-separated-values')
+            return self._export_csv(req, query, '\t',
+                                    mimetype='text/tab-separated-values')
 
     # INavigationContributor methods
 
@@ -872,7 +900,8 @@ class QueryModule(Component):
     def get_navigation_items(self, req):
         from trac.ticket.report import ReportModule
         if 'TICKET_VIEW' in req.perm and \
-                not self.env.is_component_enabled(ReportModule):
+                (not self.env.is_component_enabled(ReportModule) or
+                 'REPORT_VIEW' not in req.perm):
             yield ('mainnav', 'tickets',
                    tag.a(_('View Tickets'), href=req.href.query()))
 
@@ -883,6 +912,9 @@ class QueryModule(Component):
 
     def process_request(self, req):
         req.perm.assert_permission('TICKET_VIEW')
+        report_id = req.args.getfirst('report')
+        if report_id:
+            req.perm('report', report_id).assert_permission('REPORT_VIEW')
 
         constraints = self._get_constraints(req)
         args = req.args
@@ -897,7 +929,7 @@ class QueryModule(Component):
                 qstring = self.default_anonymous_query
                 user = email or name or None
 
-            self.log.debug('QueryModule: Using default query: %s', str(qstring))
+            self.log.debug('QueryModule: Using default query: %s', qstring)
             if qstring.startswith('?'):
                 arg_list = parse_arg_list(qstring[1:])
                 args = arg_list_to_args(arg_list)
@@ -937,9 +969,14 @@ class QueryModule(Component):
         max = args.get('max')
         if max is None and format in ('csv', 'tab'):
             max = 0 # unlimited unless specified explicitly
-        query = Query(self.env, req.args.get('report'),
-                      constraints, cols, args.get('order'),
-                      'desc' in args, args.get('group'),
+        order = args.get('order')
+        if isinstance(order, (list, tuple)):
+            order = order[0] if order else None
+        group = args.get('group')
+        if isinstance(group, (list, tuple)):
+            group = group[0] if group else None
+        query = Query(self.env, report_id,
+                      constraints, cols, order, 'desc' in args, group,
                       'groupdesc' in args, 'verbose' in args,
                       rows,
                       args.get('page'),
@@ -1055,7 +1092,7 @@ class QueryModule(Component):
     def display_html(self, req, query):
         # The most recent query is stored in the user session;
         orig_list = None
-        orig_time = datetime.now(utc)
+        orig_time = datetime_now(utc)
         query_time = int(req.session.get('query_time', 0))
         query_time = datetime.fromtimestamp(query_time, utc)
         query_constraints = unicode(query.constraints)
@@ -1137,31 +1174,57 @@ class QueryModule(Component):
         return 'query.html', data, None
 
     def export_csv(self, req, query, sep=',', mimetype='text/plain'):
-        content = StringIO()
-        content.write('\xef\xbb\xbf')   # BOM
-        cols = query.get_columns()
-        writer = csv.writer(content, delimiter=sep, quoting=csv.QUOTE_MINIMAL)
-        writer.writerow([unicode(c).encode('utf-8') for c in cols])
+        """:deprecated: since 1.0.6, use `_export_csv` instead. Will be
+                        removed in 1.3.1.
+        """
+        content, content_type = self._export_csv(req, query, sep, mimetype)
+        return ''.join(content), content_type
 
-        context = web_context(req)
-        results = query.execute(req)
-        for result in results:
-            ticket = Resource('ticket', result['id'])
-            if 'TICKET_VIEW' in req.perm(ticket):
-                values = []
-                for col in cols:
-                    value = result[col]
-                    if col in ('cc', 'reporter'):
-                        value = Chrome(self.env).format_emails(
-                                    context.child(ticket), value)
-                    elif col in query.time_fields:
-                        value = format_datetime(value, '%Y-%m-%d %H:%M:%S',
-                                                tzinfo=req.tz)
-                    values.append(unicode(value).encode('utf-8'))
-                writer.writerow(values)
-        return (content.getvalue(), '%s;charset=utf-8' % mimetype)
+    def _export_csv(self, req, query, sep=',', mimetype='text/plain'):
+        def iterate():
+            out = StringIO()
+            writer = csv.writer(out, delimiter=sep, quoting=csv.QUOTE_MINIMAL)
+
+            def writerow(values):
+                writer.writerow([unicode(value).encode('utf-8')
+                                 for value in values])
+                rv = out.getvalue()
+                out.truncate(0)
+                return rv
+
+            yield '\xef\xbb\xbf'  # BOM
+
+            cols = query.get_columns()
+            yield writerow(cols)
+
+            chrome = Chrome(self.env)
+            context = web_context(req)
+            results = query.execute(req)
+            for result in results:
+                ticket = Resource('ticket', result['id'])
+                if 'TICKET_VIEW' in req.perm(ticket):
+                    values = []
+                    for col in cols:
+                        value = result[col]
+                        if col in ('cc', 'owner', 'reporter'):
+                            value = chrome.format_emails(context.child(ticket),
+                                                         value)
+                        elif col in query.time_fields:
+                            value = format_datetime(value, '%Y-%m-%d %H:%M:%S',
+                                                    tzinfo=req.tz)
+                        values.append(value)
+                    yield writerow(values)
+
+        return iterate(), '%s;charset=utf-8' % mimetype
 
     def export_rss(self, req, query):
+        """:deprecated: since 1.0.6, use `_export_rss` instead. Will be
+                        removed in 1.3.1.
+        """
+        content, content_type = self._export_rss(req, query)
+        return ''.join(content), content_type
+
+    def _export_rss(self, req, query):
         context = web_context(req, 'query', absurls=True)
         query_href = query.get_href(context.href)
         if 'description' not in query.rows:
@@ -1173,7 +1236,8 @@ class QueryModule(Component):
             'query_href': query_href
         }
         output = Chrome(self.env).render_template(req, 'query.rss', data,
-                                                  'application/rss+xml')
+                                                  'application/rss+xml',
+                                                  iterable=True)
         return output, 'application/rss+xml'
 
     # IWikiSyntaxProvider methods
@@ -1215,7 +1279,7 @@ class TicketQueryMacro(WikiMacroBase):
     can be included in field values by escaping them with a backslash (`\`).
 
     Groups of field constraints to be OR-ed together can be separated by a
-    litteral `or` argument.
+    literal `or` argument.
 
     In addition to filters, several other named parameters can be used
     to control how the results are presented. All of them are optional.
@@ -1253,6 +1317,9 @@ class TicketQueryMacro(WikiMacroBase):
     The `rows` parameter can be used to specify which field(s) should
     be viewed as a row, e.g. `rows=description|summary`
 
+    The `col` parameter can be used to specify which fields should
+    be viewed as columns. For '''table''' format only.
+
     For compatibility with Trac 0.10, if there's a last positional parameter
     given to the macro, it will be used to specify the `format`.
     Also, using "&" as a field separator still works (except for `order`)
@@ -1267,7 +1334,7 @@ class TicketQueryMacro(WikiMacroBase):
         clauses = [{}]
         argv = []
         kwargs = {}
-        for arg in TicketQueryMacro._comma_splitter.split(content):
+        for arg in TicketQueryMacro._comma_splitter.split(content or ''):
             arg = arg.replace(r'\,', ',')
             m = re.match(r'\s*[^=]+=', arg)
             if m:
@@ -1313,10 +1380,16 @@ class TicketQueryMacro(WikiMacroBase):
 
         if format == 'count':
             cnt = query.count(req)
-            return tag.span(cnt, title='%d tickets for which %s' %
-                            (cnt, query_string), class_='query_count')
+            title = ngettext("%(num)d ticket for which %(query)s",
+                             "%(num)d tickets for which %(query)s",
+                             cnt, query=query_string)
+            return tag.span(cnt, title=title, class_='query_count')
 
-        tickets = query.execute(req)
+        try:
+            tickets = query.execute(req)
+        except QueryValueError, e:
+            self.log.warn(e)
+            return system_message(_("Error executing TicketQuery macro"), e)
 
         if format == 'table':
             data = query.template_data(formatter.context, tickets,
@@ -1336,14 +1409,21 @@ class TicketQueryMacro(WikiMacroBase):
             add_stylesheet(req, 'common/css/roadmap.css')
 
             def query_href(extra_args, group_value = None):
-                q = Query.from_string(self.env, query_string)
+                q = query_string + ''.join('&%s=%s' % (kw, v)
+                                           for kw in extra_args
+                                           if kw not in ['group', 'status']
+                                           for v in extra_args[kw])
+                q = Query.from_string(self.env, q)
+                args = {}
                 if q.group:
-                    extra_args[q.group] = group_value
-                    q.group = None
+                    args[q.group] = group_value
+                q.group = extra_args.get('group')
+                if 'status' in extra_args:
+                    args['status'] = extra_args['status']
                 for constraint in q.constraints:
-                    constraint.update(extra_args)
+                    constraint.update(args)
                 if not q.constraints:
-                    q.constraints.append(extra_args)
+                    q.constraints.append(args)
                 return q.get_href(formatter.context)
             chrome = Chrome(self.env)
             tickets = apply_ticket_permissions(self.env, req, tickets)

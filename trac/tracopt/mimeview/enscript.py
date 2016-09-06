@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2004-2009 Edgewall Software
+# Copyright (C) 2004-2013 Edgewall Software
 # Copyright (C) 2004 Daniel Lundin <daniel@edgewall.com>
 # Copyright (C) 2005 Christopher Lenz <cmlenz@gmx.de>
 # All rights reserved.
@@ -136,7 +136,7 @@ class EnscriptRenderer(Component):
         mimetype = mimetype.split(';', 1)[0] # strip off charset
         mode = self._types[mimetype][0]
         cmdline += ' --color -h -q --language=html -p - -E%s' % mode
-        self.log.debug("Enscript command line: %s" % cmdline)
+        self.log.debug("Enscript command line: %s", cmdline)
 
         np = NaivePopen(cmdline, content.encode('utf-8'), capturestderr=1)
         if np.errorlevel or np.err:

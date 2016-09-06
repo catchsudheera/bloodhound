@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C)2005-2009 Edgewall Software
+# Copyright (C) 2005-2013 Edgewall Software
 # Copyright (C) 2005 Christopher Lenz <cmlenz@gmx.de>
 # All rights reserved.
 #
@@ -15,10 +15,9 @@
 # Author: Christopher Lenz <cmlenz@gmx.de>
 
 from datetime import datetime
+import locale
 import new
 import os.path
-import stat
-import shutil
 import tempfile
 import unittest
 
@@ -30,20 +29,82 @@ try:
 except ImportError:
     has_svn = False
 
-from trac.test import EnvironmentStub, TestSetup
+from genshi.core import Stream
+
+import trac.tests.compat
+from trac.test import EnvironmentStub, Mock, MockPerm, TestSetup
 from trac.core import TracError
+from trac.mimeview.api import RenderingContext
 from trac.resource import Resource, resource_exists
 from trac.util.concurrency import get_thread_id
 from trac.util.datefmt import utc
-from trac.versioncontrol import DbRepositoryProvider, Changeset, Node, \
-                                NoSuchChangeset
-from tracopt.versioncontrol.svn import svn_fs
+from trac.versioncontrol.api import DbRepositoryProvider, Changeset, \
+                                    InvalidRepository, Node, \
+                                    NoSuchChangeset, RepositoryManager
+from trac.web.chrome import web_context
+from trac.web.href import Href
+from tracopt.versioncontrol.svn import svn_fs, svn_prop
 
-REPOS_PATH = os.path.join(tempfile.gettempdir(), 'trac-svnrepos')
+
+REPOS_PATH = None
 REPOS_NAME = 'repo'
+URL = 'svn://test'
 
-HEAD = 22
-TETE = 21
+HEAD = 30
+TETE = 26
+
+NATIVE_EOL = '\r\n' if os.name == 'nt' else '\n'
+
+
+def _create_context():
+    req = Mock(base_path='', chrome={}, args={}, session={},
+               abs_href=Href('/'), href=Href('/'), locale=None,
+               perm=MockPerm(), authname='anonymous', tz=utc)
+    return web_context(req)
+
+
+def setlocale(*locales):
+    """Decorator to call test method with each locale.
+    """
+    if os.name != 'nt':
+        locales_map = {'de': 'de_DE.UTF8', 'fr': 'fr_FR.UTF8',
+                       'pl': 'pl_PL.UTF8', 'ja': 'ja_JP.UTF8',
+                       'zh_CN': 'zh_CN.UTF8'}
+    else:
+        locales_map = {'de': 'German_Germany', 'fr': 'French_France',
+                       'pl': 'Polish_Poland', 'ja': 'Japanese_Japan',
+                       'zh_CN': "Chinese_People's Republic of China"}
+    locales_map['C'] = 'C'
+
+    def getlocale():
+        rv = locale.getlocale(locale.LC_ALL)
+        return rv if rv[0] else 'C'
+
+    def setlocale(locale_id):
+        locale_id = locales_map[locale_id]
+        try:
+            locale.setlocale(locale.LC_ALL, locale_id)
+            return True
+        except locale.Error:
+            return False
+
+    def wrap(fn, locales):
+        def wrapped(*args, **kwargs):
+            saved_locale = getlocale()
+            try:
+                for locale_id in locales:
+                    if setlocale(locale_id):
+                        fn(*args, **kwargs)
+            finally:
+                locale.setlocale(locale.LC_ALL, saved_locale)
+        return wrapped
+
+    if len(locales) == 1 and hasattr(locales[0], '__call__'):
+        return wrap(locales[0], sorted(locales_map))
+    else:
+        def decorator(fn):
+            return wrap(fn, locales)
+        return decorator
 
 
 class SubversionRepositoryTestSetup(TestSetup):
@@ -57,8 +118,6 @@ class SubversionRepositoryTestSetup(TestSetup):
         pool = core.svn_pool_create(None)
         dumpstream = None
         try:
-            if os.path.exists(REPOS_PATH):
-                print 'trouble ahead with db/rep-cache.db... see #8278'
             r = repos.svn_repos_create(REPOS_PATH, '', '', None, None, pool)
             if hasattr(repos, 'svn_repos_load_fs2'):
                 repos.svn_repos_load_fs2(r, dumpfile, StringIO(),
@@ -83,16 +142,20 @@ class SubversionRepositoryTestSetup(TestSetup):
 
 class NormalTests(object):
 
+    def test_invalid_path_raises(self):
+        self.assertRaises(InvalidRepository, svn_fs.SubversionRepository,
+                          '/the/invalid/path', [], self.env.log)
+
     def test_resource_exists(self):
         repos = Resource('repository', REPOS_NAME)
-        self.assertEqual(True, resource_exists(self.env, repos))
-        self.assertEqual(False, resource_exists(self.env, repos(id='xxx')))
+        self.assertTrue(resource_exists(self.env, repos))
+        self.assertFalse(resource_exists(self.env, repos(id='xxx')))
         node = repos.child('source', u'tête')
-        self.assertEqual(True, resource_exists(self.env, node))
-        self.assertEqual(False, resource_exists(self.env, node(id='xxx')))
+        self.assertTrue(resource_exists(self.env, node))
+        self.assertFalse(resource_exists(self.env, node(id='xxx')))
         cset = repos.child('changeset', HEAD)
-        self.assertEqual(True, resource_exists(self.env, cset))
-        self.assertEqual(False, resource_exists(self.env, cset(id=123456)))
+        self.assertTrue(resource_exists(self.env, cset))
+        self.assertFalse(resource_exists(self.env, cset(id=123456)))
 
     def test_repos_normalize_path(self):
         self.assertEqual('/', self.repos.normalize_path('/'))
@@ -112,45 +175,55 @@ class NormalTests(object):
         self.assertEqual(HEAD, self.repos.normalize_rev(None))
         self.assertEqual(11, self.repos.normalize_rev('11'))
         self.assertEqual(11, self.repos.normalize_rev(11))
+        self.assertRaises(NoSuchChangeset, self.repos.normalize_rev, -1)
+        self.assertRaises(NoSuchChangeset, self.repos.normalize_rev, -42)
 
     def test_rev_navigation(self):
         self.assertEqual(1, self.repos.oldest_rev)
-        self.assertEqual(None, self.repos.previous_rev(0))
-        self.assertEqual(None, self.repos.previous_rev(1))
+        self.assertIsNone(self.repos.previous_rev(0))
+        self.assertIsNone(self.repos.previous_rev(1))
         self.assertEqual(HEAD, self.repos.youngest_rev)
         self.assertEqual(6, self.repos.next_rev(5))
         self.assertEqual(7, self.repos.next_rev(6))
         # ...
-        self.assertEqual(None, self.repos.next_rev(HEAD))
+        self.assertIsNone(self.repos.next_rev(HEAD))
         self.assertRaises(NoSuchChangeset, self.repos.normalize_rev, HEAD + 1)
 
     def test_rev_path_navigation(self):
         self.assertEqual(1, self.repos.oldest_rev)
-        self.assertEqual(None, self.repos.previous_rev(0, u'tête'))
-        self.assertEqual(None, self.repos.previous_rev(1, u'tête'))
+        self.assertIsNone(self.repos.previous_rev(0, u'tête'))
+        self.assertIsNone(self.repos.previous_rev(1, u'tête'))
         self.assertEqual(HEAD, self.repos.youngest_rev)
         self.assertEqual(6, self.repos.next_rev(5, u'tête'))
         self.assertEqual(13, self.repos.next_rev(6, u'tête'))
         # ...
-        self.assertEqual(None, self.repos.next_rev(HEAD, u'tête'))
+        self.assertIsNone(self.repos.next_rev(HEAD, u'tête'))
         # test accentuated characters
-        self.assertEqual(None,
-                         self.repos.previous_rev(17, u'tête/R\xe9sum\xe9.txt'))
+        self.assertIsNone(self.repos.previous_rev(17, u'tête/R\xe9sum\xe9.txt'))
         self.assertEqual(17, self.repos.next_rev(16, u'tête/R\xe9sum\xe9.txt'))
 
     def test_has_node(self):
-        self.assertEqual(False, self.repos.has_node(u'/tête/dir1', 3))
-        self.assertEqual(True, self.repos.has_node(u'/tête/dir1', 4))
-        self.assertEqual(True, self.repos.has_node(u'/tête/dir1'))
+        self.assertFalse(self.repos.has_node(u'/tête/dir1', 3))
+        self.assertTrue(self.repos.has_node(u'/tête/dir1', 4))
+        self.assertTrue(self.repos.has_node(u'/tête/dir1'))
 
     def test_get_node(self):
+        node = self.repos.get_node(u'/')
+        self.assertEqual(u'', node.name)
+        self.assertEqual(u'/', node.path)
+        self.assertEqual(Node.DIRECTORY, node.kind)
+        self.assertEqual(HEAD, node.rev)
+        self.assertEqual(HEAD, node.created_rev)
+        self.assertEqual(datetime(2015, 6, 15, 14, 9, 13, 664490, utc),
+                         node.last_modified)
+        self.assertRaises(NoSuchChangeset, self.repos.get_node, u'/', -1)
         node = self.repos.get_node(u'/tête')
         self.assertEqual(u'tête', node.name)
         self.assertEqual(u'/tête', node.path)
         self.assertEqual(Node.DIRECTORY, node.kind)
         self.assertEqual(HEAD, node.rev)
         self.assertEqual(TETE, node.created_rev)
-        self.assertEqual(datetime(2007, 4, 30, 17, 45, 26, 234375, utc),
+        self.assertEqual(datetime(2013, 4, 28, 5, 36, 6, 29637, utc),
                          node.last_modified)
         node = self.repos.get_node(u'/tête/README.txt')
         self.assertEqual('README.txt', node.name)
@@ -195,9 +268,9 @@ class NormalTests(object):
 
     def test_get_dir_content(self):
         node = self.repos.get_node(u'/tête')
-        self.assertEqual(None, node.content_length)
-        self.assertEqual(None, node.content_type)
-        self.assertEqual(None, node.get_content())
+        self.assertIsNone(node.content_length)
+        self.assertIsNone(node.content_type)
+        self.assertIsNone(node.get_content())
 
     def test_get_file_content(self):
         node = self.repos.get_node(u'/tête/README.txt')
@@ -216,6 +289,214 @@ class NormalTests(object):
         self.assertEqual('native', props['svn:eol-style'])
         self.assertEqual('text/plain', props['svn:mime-type'])
 
+    def test_get_file_content_without_native_eol_style(self):
+        f = self.repos.get_node(u'/tête/README.txt', 2)
+        props = f.get_properties()
+        self.assertIsNone(props.get('svn:eol-style'))
+        self.assertEqual('A text.\n', f.get_content().read())
+        self.assertEqual('A text.\n', f.get_processed_content().read())
+
+    def test_get_file_content_with_native_eol_style(self):
+        f = self.repos.get_node(u'/tête/README.txt', 3)
+        props = f.get_properties()
+        self.assertEqual('native', props.get('svn:eol-style'))
+
+        self.repos.params['eol_style'] = 'native'
+        self.assertEqual('A test.\n', f.get_content().read())
+        self.assertEqual('A test.' + NATIVE_EOL,
+                         f.get_processed_content().read())
+
+        self.repos.params['eol_style'] = 'LF'
+        self.assertEqual('A test.\n', f.get_content().read())
+        self.assertEqual('A test.\n', f.get_processed_content().read())
+
+        self.repos.params['eol_style'] = 'CRLF'
+        self.assertEqual('A test.\n', f.get_content().read())
+        self.assertEqual('A test.\r\n', f.get_processed_content().read())
+
+        self.repos.params['eol_style'] = 'CR'
+        self.assertEqual('A test.\n', f.get_content().read())
+        self.assertEqual('A test.\r', f.get_processed_content().read())
+        # check that the hint is stronger than the repos default
+        self.assertEqual('A test.\r\n',
+                         f.get_processed_content(eol_hint='CRLF').read())
+
+    def test_get_file_content_with_native_eol_style_and_no_keywords_28(self):
+        f = self.repos.get_node(u'/branches/v4/README.txt', 28)
+        props = f.get_properties()
+        self.assertEqual('native', props.get('svn:eol-style'))
+        self.assertIsNone(props.get('svn:keywords'))
+
+        self.assertEqual(
+            'A test.\n' +
+            '# $Rev$ is not substituted with no svn:keywords.\n',
+            f.get_content().read())
+        self.assertEqual(
+            'A test.\r\n' +
+            '# $Rev$ is not substituted with no svn:keywords.\r\n',
+            f.get_processed_content(eol_hint='CRLF').read())
+
+    def test_get_file_content_with_keyword_substitution_23(self):
+        f = self.repos.get_node(u'/tête/Résumé.txt', 23)
+        props = f.get_properties()
+        self.assertEqual('Revision Author URL', props['svn:keywords'])
+        self.assertEqual('''\
+# Simple test for svn:keywords property substitution (#717)
+# $Rev: 23 $:     Revision of last commit
+# $Author: cboos $:  Author of last commit
+# $Date$:    Date of last commit (not substituted)
+
+Now with fixed width fields:
+# $URL:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.txt    $ the configured URL
+# $HeadURL:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.tx#$ same
+# $URL:: svn://test/t%C#$ same, but truncated
+
+En r\xe9sum\xe9 ... \xe7a marche.
+'''.splitlines(), f.get_processed_content().read().splitlines())
+    # Note: "En résumé ... ça marche." in the content is really encoded in
+    #       latin1 in the file, and our substitutions are UTF-8 encoded...
+    #       This is expected.
+
+    def test_get_file_content_with_keyword_substitution_24(self):
+        f = self.repos.get_node(u'/tête/Résumé.txt', 24)
+        props = f.get_properties()
+        self.assertEqual('Revision Author URL Id', props['svn:keywords'])
+        self.assertEqual('''\
+# Simple test for svn:keywords property substitution (#717)
+# $Rev: 24 $:     Revision of last commit
+# $Author: cboos $:  Author of last commit
+# $Date$:    Date of last commit (now substituted)
+# $Id: Résumé.txt 24 2013-04-27 14:38:50Z cboos $:      Combination
+
+Now with fixed width fields:
+# $URL:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.txt    $ the configured URL
+# $HeadURL:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.tx#$ same
+# $URL:: svn://test/t%C#$ same, but truncated
+# $Header::                                           $ combination with URL
+
+En r\xe9sum\xe9 ... \xe7a marche.
+'''.splitlines(), f.get_processed_content().read().splitlines())
+
+    @setlocale
+    def test_get_file_content_with_keyword_substitution_25(self):
+        f = self.repos.get_node(u'/tête/Résumé.txt', 25)
+        props = f.get_properties()
+        self.assertEqual('Revision Author URL Date Id Header',
+                         props['svn:keywords'])
+        self.assertEqual('''\
+# Simple test for svn:keywords property substitution (#717)
+# $Rev: 25 $:     Revision of last commit
+# $Author: cboos $:  Author of last commit
+# $Date: 2013-04-27 14:43:15 +0000 (Sat, 27 Apr 2013) $:    Date of last commit (now really substituted)
+# $Id: Résumé.txt 25 2013-04-27 14:43:15Z cboos $:      Combination
+
+Now with fixed width fields:
+# $URL:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.txt    $ the configured URL
+# $HeadURL:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.tx#$ same
+# $URL:: svn://test/t%C#$ same, but truncated
+# $Header:: svn://test/t%C3%AAte/R%C3%A9sum%C3%A9.txt#$ combination with URL
+
+En r\xe9sum\xe9 ... \xe7a marche.
+'''.splitlines(), f.get_processed_content().read().splitlines())
+
+    @setlocale
+    def test_get_file_content_with_keyword_substitution_30(self):
+        self.maxDiff = None
+        f = self.repos.get_node(u'/branches/v4/Résumé.txt', 30)
+        props = f.get_properties()
+        expected = [
+            '# Simple test for svn:keywords property substitution (#717)',
+            '# $Rev: 30 $:     Revision of last commit',
+            '# $Author: jomae $:  Author of last commit',
+            '# $Date: 2015-06-15 14:09:13 +0000 (Mon, 15 Jun 2015) $:    ' \
+                'Date of last commit (now really substituted)',
+            '# $Id: Résumé.txt 30 2015-06-15 14:09:13Z jomae $:      ' \
+                'Combination',
+            '',
+            'Now with fixed width fields:',
+            '# $URL:: svn://test/branches/v4/R%C3%A9sum%C3%A9.txt  $ ' \
+                'the configured URL',
+            '# $HeadURL:: svn://test/branches/v4/R%C3%A9sum%C3%A9.#$ same',
+            '# $URL:: svn://test/bra#$ same, but truncated',
+            '# $Header:: svn://test/branches/v4/R%C3%A9sum%C3%A9.t#$ ' \
+                'combination with URL',
+            '',
+            'Overlapped keywords:',
+            '# $Xxx$Rev: 30 $Xxx$',
+            '# $Rev: 30 $Xxx$Rev: 30 $',
+            '# $Rev: 30 $Rev$Rev: 30 $',
+            '',
+            'Custom keyword definitions (#11364)',
+            '# $_Author: jomae $:',
+            '# $_Basename: R\xc3\xa9sum\xc3\xa9.txt $:',
+            '# $_ShortDate: 2015-06-15 14:09:13Z $:',
+            '# $_LongDate: 2015-06-15 14:09:13 +0000 (Mon, 15 Jun 2015) $:',
+            '# $_Path: branches/v4/R\xc3\xa9sum\xc3\xa9.txt $:',
+            '# $_Rev: 30 $:',
+            '# $_RootURL: svn://test $:',
+            '# $_URL: svn://test/branches/v4/R%C3%A9sum%C3%A9.txt $:',
+            '# $_Header: branches/v4/R\xc3\xa9sum\xc3\xa9.txt 30 ' \
+                '2015-06-15 14:09:13Z jomae $:',
+            '# $_Id: R\xc3\xa9sum\xc3\xa9.txt 30 ' \
+                '2015-06-15 14:09:13Z jomae $:',
+            '# $_Header2: branches/v4/R\xc3\xa9sum\xc3\xa9.txt 30 ' \
+                '2015-06-15 14:09:13Z jomae $:',
+            '# $_Id2: R\xc3\xa9sum\xc3\xa9.txt 30 ' \
+                '2015-06-15 14:09:13Z jomae $:',
+            '# $_t\xc3\xa9t\xc3\xa9: jomae $:',
+            '# $42: jomae $:',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '123456789012345678901234567890123456789: j $:',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '1234567890123456789012345678901234567890:  $:',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901$:',
+            '# $_TooLong: branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'branches/v4/R\xc3\xa9sum\xc3\xa9.txt' \
+                'br $:',
+            '',
+            'Custom keyword definitions with fixed width',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '1234567890123456789012345678901234:: jomae $',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '1234567890123456789012345678901234::        $',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678:: j#$',
+            '# $123456789012345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678901234567890' \
+                '12345678901234567890123456789012345678::    $',
+        ]
+        self.assertEqual(expected,
+                         f.get_processed_content().read().splitlines())
+
     def test_created_path_rev(self):
         node = self.repos.get_node(u'/tête/README3.txt', 15)
         self.assertEqual(15, node.rev)
@@ -229,6 +510,50 @@ class NormalTests(object):
         self.assertEqual('/tags/v1/README.txt', node.path)
         self.assertEqual(3, node.created_rev)
         self.assertEqual(u'tête/README.txt', node.created_path)
+
+    def test_get_annotations(self):
+        # svn_client_blame2() requires a canonical uri since Subversion 1.7.
+        # If the uri is not canonical, assertion raises (#11167).
+        node = self.repos.get_node(u'/tête/R\xe9sum\xe9.txt', 25)
+        self.assertEqual([23, 23, 23, 25, 24, 23, 23, 23, 23, 23, 24, 23, 20],
+                         node.get_annotations())
+
+    def test_get_annotations_lower_drive_letter(self):
+        # If the drive letter in the uri is lower case on Windows, a
+        # SubversionException raises (#10514).
+        drive, tail = os.path.splitdrive(REPOS_PATH)
+        repos_path = drive.lower() + tail
+        DbRepositoryProvider(self.env).add_repository('lowercase', repos_path,
+                                                      'direct-svnfs')
+        repos = self.env.get_repository('lowercase')
+        node = repos.get_node(u'/tête/R\xe9sum\xe9.txt', 25)
+        self.assertEqual([23, 23, 23, 25, 24, 23, 23, 23, 23, 23, 24, 23, 20],
+                         node.get_annotations())
+
+    if os.name != 'nt':
+        del test_get_annotations_lower_drive_letter
+
+    def test_get_annotations_with_urlencoded_percent_sign(self):
+        node = self.repos.get_node(u'/branches/t10386/READ%25ME.txt')
+        self.assertEqual([14], node.get_annotations())
+
+    def test_get_path_url(self):
+        self.assertEqual('svn://test', self.repos.get_path_url('', 42))
+        self.assertEqual('svn://test', self.repos.get_path_url('/', 42))
+        self.assertEqual('svn://test/path/to/file.txt',
+                         self.repos.get_path_url('path/to/file.txt', 42))
+        self.assertEqual('svn://test/path/to/file.txt',
+                         self.repos.get_path_url('/path/to/file.txt', 42))
+        self.assertEqual('svn://test/trunk%25/Resume%25.txt',
+                         self.repos.get_path_url('trunk%/Resume%.txt', 42))
+        self.assertEqual('svn://test/trunk%23/Resume%23.txt',
+                         self.repos.get_path_url('trunk#/Resume#.txt', 42))
+        self.assertEqual('svn://test/trunk%3F/Resume%3F.txt',
+                         self.repos.get_path_url('trunk?/Resume?.txt', 42))
+        self.assertEqual('svn://test/trunk%40/Resume.txt%4042',
+                         self.repos.get_path_url('trunk@/Resume.txt@42', 42))
+        self.assertEqual('svn://test/tr%C3%BCnk/R%C3%A9sum%C3%A9.txt',
+                         self.repos.get_path_url(u'trünk/Résumé.txt', 42))
 
     # Revision Log / node history
 
@@ -538,6 +863,179 @@ class NormalTests(object):
         self.assertEqual(u'Chez moi ça marche\n', chgset.message)
         self.assertEqual(u'Jonas Borgström', chgset.author)
 
+    def test_canonical_repos_path(self):
+        # Assertion `svn_dirent_is_canonical` with leading double slashes
+        # in repository path if os.name == 'posix' (#10390)
+        DbRepositoryProvider(self.env).add_repository(
+            'canonical-path', '//' + REPOS_PATH.lstrip('/'), 'direct-svnfs')
+        repos = self.env.get_repository('canonical-path')
+        self.assertEqual(REPOS_PATH, repos.path)
+
+    if os.name != 'posix':
+        del test_canonical_repos_path
+
+    def test_merge_prop_renderer_without_deleted_branches(self):
+        context = _create_context()
+        context = context(self.repos.get_node('branches/v1x', HEAD).resource)
+        renderer = svn_prop.SubversionMergePropertyRenderer(self.env)
+        props = {'svn:mergeinfo': u"""\
+/tête:1-20,23-26
+/branches/v3:22
+/branches/v2:16
+"""}
+        result = Stream(renderer.render_property('svn:mergeinfo', 'browser',
+                                                 context, props))
+
+        node = unicode(result.select('//tr[1]//td[1]'))
+        self.assertIn(' href="/browser/repo/branches/v2?rev=%d"' % HEAD, node)
+        self.assertIn('>/branches/v2</a>', node)
+        node = unicode(result.select('//tr[1]//td[2]'))
+        self.assertIn(' title="16"', node)
+        self.assertIn('>merged</a>', node)
+        node = unicode(result.select('//tr[1]//td[3]'))
+        self.assertIn(' title="No revisions"', node)
+        self.assertIn('>eligible</span>', node)
+
+        node = unicode(result.select('//tr[3]//td[1]'))
+        self.assertIn(' href="/browser/repo/%s?rev=%d"' % ('t%C3%AAte', HEAD),
+                      node)
+        self.assertIn(u'>/tête</a>', node)
+        node = unicode(result.select('//tr[3]//td[2]'))
+        self.assertIn(' title="1-20, 23-26"', node)
+        self.assertIn(' href="/log/repo/t%C3%AAte?revs=1-20%2C23-26"', node)
+        self.assertIn('>merged</a>', node)
+        node = unicode(result.select('//tr[3]//td[3]'))
+        self.assertIn(' title="21"', node)
+        self.assertIn(' href="/changeset/21/repo/t%C3%AAte"', node)
+        self.assertIn('>eligible</a>', node)
+
+        self.assertNotIn('(toggle deleted branches)', unicode(result))
+        self.assertNotIn('False', unicode(result))  # See #12125
+
+    def test_merge_prop_renderer_with_deleted_branches(self):
+        context = _create_context()
+        context = context(self.repos.get_node('branches/v1x', HEAD).resource)
+        renderer = svn_prop.SubversionMergePropertyRenderer(self.env)
+        props = {'svn:mergeinfo': u"""\
+/tête:19
+/branches/v3:22
+/branches/deleted:1,3-5,22
+"""}
+        result = Stream(renderer.render_property('svn:mergeinfo', 'browser',
+                                                 context, props))
+
+        node = unicode(result.select('//tr[1]//td[1]'))
+        self.assertIn(' href="/browser/repo/branches/v3?rev=%d"' % HEAD, node)
+        self.assertIn('>/branches/v3</a>', node)
+        node = unicode(result.select('//tr[1]//td[2]'))
+        self.assertIn(' title="22"', node)
+        self.assertIn('>merged</a>', node)
+        node = unicode(result.select('//tr[1]//td[3]'))
+        self.assertIn(' title="No revisions"', node)
+        self.assertIn('>eligible</span>', node)
+
+        node = unicode(result.select('//tr[2]//td[1]'))
+        self.assertIn(' href="/browser/repo/%s?rev=%d"' % ('t%C3%AAte', HEAD),
+                      node)
+        self.assertIn(u'>/tête</a>', node)
+        node = unicode(result.select('//tr[2]//td[2]'))
+        self.assertIn(' title="19"', node)
+        self.assertIn(' href="/changeset/19/repo/t%C3%AAte"', node)
+        self.assertIn('>merged</a>', node)
+        node = unicode(result.select('//tr[2]//td[3]'))
+        self.assertIn(' title="13-14, 17-18, 20-21, 23-26"', node)
+        self.assertIn(' href="/log/repo/t%C3%AAte?revs='
+                      '13-14%2C17-18%2C20-21%2C23-26"', node)
+        self.assertIn('>eligible</a>', node)
+
+        self.assertIn('(toggle deleted branches)', unicode(result))
+        self.assertIn('<td>/branches/deleted</td>',
+                      unicode(result.select('//tr[3]//td[1]')))
+        self.assertIn(u'<td colspan="2">1,\u200b3-5,\u200b22</td>',
+                      unicode(result.select('//tr[3]//td[2]')))
+
+    def test_merge_prop_diff_renderer_added(self):
+        context = _create_context()
+        old_context = context(self.repos.get_node(u'tête', 20).resource)
+        old_props = {'svn:mergeinfo': u"""\
+/branches/v2:1,8-9,12-15
+/branches/v1x:12
+/branches/deleted:1,3-5,22
+"""}
+        new_context = context(self.repos.get_node(u'tête', 21).resource)
+        new_props = {'svn:mergeinfo': u"""\
+/branches/v2:1,8-9,12-16
+/branches/v1x:12
+/branches/deleted:1,3-5,22
+"""}
+        options = {}
+        renderer = svn_prop.SubversionMergePropertyDiffRenderer(self.env)
+        result = Stream(renderer.render_property_diff(
+                'svn:mergeinfo', old_context, old_props, new_context,
+                new_props, options))
+
+        node = unicode(result.select('//tr[1]//td[1]'))
+        self.assertIn(' href="/browser/repo/branches/v2?rev=21"', node)
+        self.assertIn('>/branches/v2</a>', node)
+        node = unicode(result.select('//tr[1]//td[2]'))
+        self.assertIn(' title="16"', node)
+        self.assertIn(' href="/changeset/16/repo/branches/v2"', node)
+
+    def test_merge_prop_diff_renderer_wrong_mergeinfo(self):
+        rev = HEAD
+        context = _create_context()
+        old_context = context(self.repos.get_node(u'tête', rev - 1).resource)
+        old_mergeinfo = '/missing:12\n'
+        new_context = context(self.repos.get_node(u'tête', rev).resource)
+        new_mergeinfo = '/missing:12-15\n'
+        renderer = svn_prop.SubversionMergePropertyDiffRenderer(self.env)
+        result = Stream(renderer.render_property_diff(
+            'svn:mergeinfo', old_context, {'svn:mergeinfo': old_mergeinfo},
+            new_context, {'svn:mergeinfo': new_mergeinfo}, {}))
+
+        node = unicode(result.select('//tr[1]//td[1]'))
+        self.assertIn(' href="/browser/repo/missing?rev=%d"' % rev, node)
+        self.assertIn('>/missing</a>', node)
+        node = unicode(result.select('//tr[1]//td[2]'))
+        self.assertIn(' title="13-15"', node)
+        self.assertIn(' href="/log/repo/missing?revs=13-15"', node)
+
+    def test_merge_prop_diff_renderer_added_svnmerge_integrated(self):
+        # Property diff of svnmerge-integrated property (from svnmerge.py,
+        # used prior to svn 1.5) is rendered correctly.
+        context = _create_context()
+        old_context = context(self.repos.get_node(u'tête', 20).resource)
+        old_props = {'svnmerge-integrated': u"""\
+        /branches/v2:1,8-9,12-15 /branches/v1x:12 /branches/deleted:1,3-5,22
+        """}
+        new_context = context(self.repos.get_node(u'tête', 21).resource)
+        new_props = {'svnmerge-integrated': u"""\
+        /branches/v2:1,8-9,12-16 /branches/v1x:12 /branches/deleted:1,3-5,22
+        """}
+
+        renderer = svn_prop.SubversionMergePropertyDiffRenderer(self.env)
+        result = Stream(renderer.render_property_diff(
+            'svnmerge-integrated', old_context, old_props, new_context,
+            new_props, {}))
+
+        node = unicode(result.select('//tr[1]//td[1]'))
+        self.assertIn(' href="/browser/repo/branches/v2?rev=21"', node)
+        self.assertIn('>/branches/v2</a>', node)
+        node = unicode(result.select('//tr[1]//td[2]'))
+        self.assertIn(' title="16"', node)
+        self.assertIn(' href="/changeset/16/repo/branches/v2"', node)
+
+    def test_render_needslock(self):
+        htdocs_location = 'http://assets.example.org/common'
+        self.env.config.set('trac', 'htdocs_location', htdocs_location)
+        context = _create_context()
+        context.req.chrome['htdocs_location'] = htdocs_location
+        context = context(self.repos.get_node(u'tête', HEAD).resource)
+        renderer = svn_prop.SubversionPropertyRenderer(self.env)
+        result = renderer.render_property('svn:needs-lock', None, context,
+                                          {'svn:needs-lock': '*'})
+        self.assertIn('src="http://assets.example.org/common/lock-locked.png"',
+                      unicode(result))
 
 
 class ScopedTests(object):
@@ -561,17 +1059,17 @@ class ScopedTests(object):
 
     def test_rev_navigation(self):
         self.assertEqual(1, self.repos.oldest_rev)
-        self.assertEqual(None, self.repos.previous_rev(0))
+        self.assertIsNone(self.repos.previous_rev(0))
         self.assertEqual(1, self.repos.previous_rev(2))
         self.assertEqual(TETE, self.repos.youngest_rev)
         self.assertEqual(2, self.repos.next_rev(1))
         self.assertEqual(3, self.repos.next_rev(2))
         # ...
-        self.assertEqual(None, self.repos.next_rev(TETE))
+        self.assertIsNone(self.repos.next_rev(TETE))
 
     def test_has_node(self):
-        self.assertEqual(False, self.repos.has_node('/dir1', 3))
-        self.assertEqual(True, self.repos.has_node('/dir1', 4))
+        self.assertFalse(self.repos.has_node('/dir1', 3))
+        self.assertTrue(self.repos.has_node('/dir1', 4))
 
     def test_get_node(self):
         node = self.repos.get_node('/dir1')
@@ -625,9 +1123,9 @@ class ScopedTests(object):
 
     def test_get_dir_content(self):
         node = self.repos.get_node('/dir1')
-        self.assertEqual(None, node.content_length)
-        self.assertEqual(None, node.content_type)
-        self.assertEqual(None, node.get_content())
+        self.assertIsNone(node.content_length)
+        self.assertIsNone(node.content_type)
+        self.assertIsNone(node.get_content())
 
     def test_get_file_content(self):
         node = self.repos.get_node('/README.txt')
@@ -808,14 +1306,14 @@ class ScopedTests(object):
 class RecentPathScopedTests(object):
 
     def test_rev_navigation(self):
-        self.assertEqual(False, self.repos.has_node('/', 1))
-        self.assertEqual(False, self.repos.has_node('/', 2))
-        self.assertEqual(False, self.repos.has_node('/', 3))
-        self.assertEqual(True, self.repos.has_node('/', 4))
+        self.assertFalse(self.repos.has_node('/', 1))
+        self.assertFalse(self.repos.has_node('/', 2))
+        self.assertFalse(self.repos.has_node('/', 3))
+        self.assertTrue(self.repos.has_node('/', 4))
         # We can't make this work anymore because of #5213.
         # self.assertEqual(4, self.repos.oldest_rev)
         self.assertEqual(1, self.repos.oldest_rev) # should really be 4...
-        self.assertEqual(None, self.repos.previous_rev(4))
+        self.assertIsNone(self.repos.previous_rev(4))
 
 
 class NonSelfContainedScopedTests(object):
@@ -840,6 +1338,112 @@ class AnotherNonSelfContainedScopedTests(object):
                          changes.next())
 
 
+class ExternalsPropertyTests(object):
+
+    def _xpath_text(self, stream, path):
+        return unicode(stream.select(path))
+
+    def _modify_repository(self, reponame, changes):
+        DbRepositoryProvider(self.env).modify_repository(reponame, changes)
+
+    def _set_tracini_externals(self, *values):
+        config = self.env.config
+        for idx, value in enumerate(values):
+            config.set('svn:externals', str(idx), value)
+
+    def _render(self, *values):
+        props = {'svn:externals': '\n'.join(values)}
+        renderer = svn_prop.SubversionPropertyRenderer(self.env)
+        context = RenderingContext(Resource('repository', REPOS_NAME)
+                                   .child('source', 'build/posix', 42))
+        return renderer.render_property('svn:externals', None, context, props)
+
+    def _parse_result(self, result):
+        result = Stream(result)
+        idx = 1
+        items = []
+        while True:
+            if not unicode(result.select('//li[%d]' % idx)):
+                break
+            items.append(dict((key, unicode(result.select('//li[%d]/a/%s' %
+                                                          (idx, key))))
+                              for key in ('text()', '@href', '@title')))
+            idx += 1
+        return items
+
+    def test_match_property(self):
+        renderer = svn_prop.SubversionPropertyRenderer(self.env)
+        rv = renderer.match_property('svn:externals', None)
+        self.assertTrue(1 <= rv < 10000)
+
+    def test_render_property_without_tracini(self):
+        result = self._parse_result(self._render(
+            'blah svn://server/repos1',
+            'vendor http://example.org/svn/eng-soft'))
+        self.assertEqual({'text()': 'blah', '@href': '',
+                          '@title': 'No svn:externals configured in trac.ini'},
+                         result[0])
+        self.assertEqual({'text()': 'vendor',
+                          '@href': 'http://example.org/svn/eng-soft',
+                          # XXX           v should be "//"
+                          '@title': 'http:/example.org/svn/eng-soft'},
+                         result[1])
+        self.assertEqual(2, len(result))
+
+    def test_render_property_non_absolute_url(self):
+        externals = ['blah1 ../src', 'blah2 ^/src', 'blah3 /svn/trunk',
+                     'blah4 //localhost/svn']
+        result = self._parse_result(self._render(*externals))
+        self.assertEqual([{'text()': externals[0], '@href': '', '@title': ''},
+                          {'text()': externals[1], '@href': '', '@title': ''},
+                          {'text()': externals[2], '@href': '', '@title': ''},
+                          {'text()': externals[3], '@href': '', '@title': ''}],
+                         result)
+
+    def test_render_property_comment(self):
+        result = self._parse_result(self._render(
+            '   # For blah',
+            'blah svn://server/repos1',
+            '',
+            '   # path rev url .....',
+            'vendor http://example.org/svn/eng-soft'))
+        self.assertEqual({'text()': '   # For blah', '@href': '',
+                          '@title': ''}, result[0])
+        self.assertEqual('blah', result[1]['text()'])
+        self.assertEqual({'text()': '   # path rev url .....', '@href': '',
+                          '@title': ''}, result[2])
+        self.assertEqual('vendor', result[3]['text()'])
+        self.assertEqual(4, len(result))
+
+    def test_render_property_with_tracini(self):
+        self._set_tracini_externals(
+            'svn://server/repos1 http://trac/proj1/browser/$path?rev=$rev',
+            'http://example.org/svn/eng-soft '
+                'http://example.org/trac/eng-soft/browser/$path?rev=$rev')
+        result = self._parse_result(self._render(
+            'blah          svn://server/repos1',
+            'blah-doc      svn://server/repos1/doc',
+            'blah-r42 -r42 svn://server/repos1/branches/1.0-stable',
+            'vendor        http://example.org/svn/eng-soft'))
+        self.assertEqual({'text()': 'blah in svn://server/repos1',
+                          '@href': 'http://trac/proj1/browser/?rev=',
+                          '@title': ' in svn://server/repos1'}, result[0])
+        self.assertEqual({'text()': 'blah-doc in svn://server/repos1',
+                          '@href': 'http://trac/proj1/browser/doc?rev=',
+                          '@title': 'doc in svn://server/repos1'}, result[1])
+        self.assertEqual({'text()': 'blah-r42 at revision 42 in '
+                                    'svn://server/repos1',
+                          '@href': 'http://trac/proj1/browser/branches/'
+                                   '1.0-stable?rev=42',
+                          '@title': 'branches/1.0-stable at revision 42 in '
+                                    'svn://server/repos1'}, result[2])
+        self.assertEqual({
+            'text()': 'vendor in http://example.org/svn/eng-soft',
+            '@href': 'http://example.org/trac/eng-soft/browser/?rev=',
+            '@title': ' in http://example.org/svn/eng-soft'}, result[3])
+        self.assertEqual(4, len(result))
+
+
 # -- Test cases for SubversionRepository
 
 class SubversionRepositoryTestCase(unittest.TestCase):
@@ -847,11 +1451,17 @@ class SubversionRepositoryTestCase(unittest.TestCase):
     def setUp(self):
         self.env = EnvironmentStub()
         repositories = self.env.config['repositories']
-        DbRepositoryProvider(self.env).add_repository(REPOS_NAME, self.path,
-                                                      'direct-svnfs')
+        dbprovider = DbRepositoryProvider(self.env)
+        dbprovider.add_repository(REPOS_NAME, self.path, 'direct-svnfs')
+        dbprovider.modify_repository(REPOS_NAME, {'url': URL})
         self.repos = self.env.get_repository(REPOS_NAME)
 
+
     def tearDown(self):
+        self.repos.close()
+        self.repos = None
+        # clear cached repositories to avoid TypeError on termination (#11505)
+        RepositoryManager(self.env).reload_repositories()
         self.env.reset_db()
         # needed to avoid issue with 'WindowsError: The process cannot access
         # the file ... being used by another process: ...\rep-cache.db'
@@ -864,8 +1474,9 @@ class SvnCachedRepositoryTestCase(unittest.TestCase):
 
     def setUp(self):
         self.env = EnvironmentStub()
-        DbRepositoryProvider(self.env).add_repository(REPOS_NAME, self.path,
-                                                      'svn')
+        dbprovider = DbRepositoryProvider(self.env)
+        dbprovider.add_repository(REPOS_NAME, self.path, 'svn')
+        dbprovider.modify_repository(REPOS_NAME, {'url': URL})
         self.repos = self.env.get_repository(REPOS_NAME)
         self.repos.sync()
 
@@ -873,16 +1484,22 @@ class SvnCachedRepositoryTestCase(unittest.TestCase):
         self.env.reset_db()
         self.repos.close()
         self.repos = None
+        # clear cached repositories to avoid TypeError on termination (#11505)
+        RepositoryManager(self.env).reload_repositories()
 
 
 def suite():
+    global REPOS_PATH
     suite = unittest.TestSuite()
     if has_svn:
+        REPOS_PATH = tempfile.mkdtemp(prefix='trac-svnrepos-')
+        os.rmdir(REPOS_PATH)
         tests = [(NormalTests, ''),
                  (ScopedTests, u'/tête'),
                  (RecentPathScopedTests, u'/tête/dir1'),
                  (NonSelfContainedScopedTests, '/tags/v1'),
                  (AnotherNonSelfContainedScopedTests, '/branches'),
+                 (ExternalsPropertyTests, ''),
                  ]
         skipped = {
             'SvnCachedRepositoryNormalTests': [
@@ -898,19 +1515,18 @@ def suite():
                               (SubversionRepositoryTestCase, test),
                               {'path': REPOS_PATH + scope})
             suite.addTest(unittest.makeSuite(
-                tc, 'test', suiteClass=SubversionRepositoryTestSetup))
+                tc, suiteClass=SubversionRepositoryTestSetup))
             tc = new.classobj('SvnCachedRepository' + test.__name__,
                               (SvnCachedRepositoryTestCase, test),
                               {'path': REPOS_PATH + scope})
             for skip in skipped.get(tc.__name__, []):
                 setattr(tc, skip, lambda self: None) # no skip, so we cheat...
             suite.addTest(unittest.makeSuite(
-                tc, 'test', suiteClass=SubversionRepositoryTestSetup))
+                tc, suiteClass=SubversionRepositoryTestSetup))
     else:
         print("SKIP: tracopt/versioncontrol/svn/tests/svn_fs.py (no svn "
               "bindings)")
     return suite
 
 if __name__ == '__main__':
-    runner = unittest.TextTestRunner()
-    runner.run(suite())
+    unittest.main(defaultTest='suite')

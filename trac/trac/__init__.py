@@ -16,10 +16,4 @@ from pkg_resources import DistributionNotFound, get_distribution
 try:
     __version__ = get_distribution('Trac').version
 except DistributionNotFound:
-    __version__ = '1.0.1'
-
-try:
-    from hooks import install_global_hooks
-    install_global_hooks()
-except:
-    pass
+    __version__ = '1.0.13'

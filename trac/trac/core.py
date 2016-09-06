@@ -30,7 +30,7 @@ def N_(string):
 class TracError(Exception):
     """Exception base class for errors in Trac."""
 
-    title = N_('Trac Error')
+    title = N_("Trac Error")
 
     def __init__(self, message, title=None, show_traceback=False):
         """If message is a genshi.builder.tag object, everything up to
@@ -40,7 +40,7 @@ class TracError(Exception):
         message.
         """
         from trac.util.translation import gettext
-        Exception.__init__(self, message)
+        super(TracError, self).__init__(message)
         self._message = message
         self.title = title or gettext(self.title)
         self.show_traceback = show_traceback
@@ -94,23 +94,7 @@ class ComponentMeta(type):
     def __new__(mcs, name, bases, d):
         """Create the component class."""
 
-        def nonrecursive_init(cls):
-            """Replaces __init__ of the class with one that checks for
-            recursion"""
-            original_init = cls.__init__
-            compmgrs = set()
-            def new_init(self, *args, **kwargs):
-                """Only run the original __init__ once per component manager"""
-                if self.compmgr not in compmgrs:
-                    try:
-                        compmgrs.add(self.compmgr)
-                        original_init(self, *args, **kwargs)
-                    finally:
-                        compmgrs.remove(self.compmgr)
-            cls.__init__ = new_init
-            return cls
-
-        new_class = nonrecursive_init(type.__new__(mcs, name, bases, d))
+        new_class = type.__new__(mcs, name, bases, d)
         if name == 'Component':
             # Don't put the Component base class in the registry
             return new_class
@@ -141,6 +125,8 @@ class ComponentMeta(type):
             return self
 
         # The normal case where the component is not also the component manager
+        assert len(args) >= 1 and isinstance(args[0], ComponentManager), \
+               "First argument must be a ComponentManager instance"
         compmgr = args[0]
         self = compmgr.components.get(cls)
         # Note that this check is racy, we intentionally don't use a
@@ -196,7 +182,7 @@ class ComponentManager(object):
             self.components[self.__class__] = self
 
     def __contains__(self, cls):
-        """Return wether the given class is in the list of active
+        """Return whether the given class is in the list of active
         components."""
         return cls in self.components
 
@@ -204,20 +190,20 @@ class ComponentManager(object):
         """Activate the component instance for the given class, or
         return the existing instance if the component has already been
         activated.
+
+        Note that `ComponentManager` components can't be activated
+        that way.
         """
         if not self.is_enabled(cls):
             return None
         component = self.components.get(cls)
-
-        # Leave other manager components out of extension point lists
-        # see bh:comment:5:ticket:438 and ticket:11121
-        if not component and not issubclass(cls, ComponentManager) :
+        if not component and not issubclass(cls, ComponentManager):
             if cls not in ComponentMeta._components:
                 raise TracError('Component "%s" not registered' % cls.__name__)
             try:
                 component = cls(self)
             except TypeError, e:
-                raise TracError('Unable to instantiate component %r (%s)' %
+                raise TracError("Unable to instantiate component %r (%s)" %
                                 (cls, e))
         return component
 
@@ -236,6 +222,17 @@ class ComponentManager(object):
             component = component.__class__
         self.enabled[component] = False
         self.components[component] = None
+
+    def enable_component(self, component):
+        """Force a component to be enabled.
+
+        :param component: can be a class or an instance.
+
+        :since: 1.0.13
+        """
+        if not isinstance(component, type):
+            component = component.__class__
+        self.enabled[component] = True
 
     def component_activated(self, component):
         """Can be overridden by sub-classes so that special

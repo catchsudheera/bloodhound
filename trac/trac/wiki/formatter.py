@@ -24,7 +24,7 @@ import os
 from StringIO import StringIO
 
 from genshi.builder import tag, Element
-from genshi.core import Stream, Markup, escape
+from genshi.core import Stream
 from genshi.input import HTMLParser, ParseError
 from genshi.util import plaintext
 
@@ -32,10 +32,10 @@ from trac.core import *
 from trac.mimeview import *
 from trac.resource import get_relative_resource, get_resource_url
 from trac.util import arity
+from trac.util.html import Markup, TracHTMLSanitizer, escape
 from trac.util.text import exception_to_unicode, shorten_line, to_unicode, \
                            unicode_quote, unicode_quote_plus, unquote_label
-from trac.util.html import TracHTMLSanitizer
-from trac.util.translation import _
+from trac.util.translation import _, tag_
 from trac.wiki.api import WikiSystem, parse_args
 from trac.wiki.parser import WikiParser, parse_processor_args
 
@@ -69,7 +69,8 @@ def split_url_into_path_query_fragment(target):
     idx = target.find('?')
     if idx >= 0:
         target, query = target[:idx], target[idx:]
-    return (target, query, fragment)
+    return target, query, fragment
+
 
 def concat_path_query_fragment(path, query, fragment=None):
     """Assemble `path`, `query` and `fragment` into a proper URL.
@@ -97,6 +98,7 @@ def concat_path_query_fragment(path, query, fragment=None):
         f = fragment
     return p + q + ('' if f == '#' else f)
 
+
 def _markup_to_unicode(markup):
     stream = None
     if isinstance(markup, Element):
@@ -106,6 +108,10 @@ def _markup_to_unicode(markup):
     if stream:
         markup = stream.render('xhtml', encoding=None, strip_whitespace=False)
     return to_unicode(markup)
+
+
+class MacroError(TracError):
+    pass
 
 
 class ProcessorError(TracError):
@@ -150,9 +156,9 @@ class WikiProcessor(object):
                               }
 
         self.inline_check = {'html': self._html_is_inline,
-                                'htmlcomment': True, 'comment': True,
-                                'span': True, 'Span': True,
-                                }.get(name)
+                             'htmlcomment': True, 'comment': True,
+                             'span': True, 'Span': True,
+                             }.get(name)
 
         self._sanitizer = TracHTMLSanitizer(formatter.wiki.safe_schemes)
 
@@ -172,7 +178,6 @@ class WikiProcessor(object):
                         break
         if not self.processor:
             # Find a matching mimeview renderer
-            from trac.mimeview.api import Mimeview
             mimeview = Mimeview(formatter.env)
             for renderer in mimeview.renderers:
                 if renderer.get_quality_ratio(self.name) > 1:
@@ -185,7 +190,8 @@ class WikiProcessor(object):
                     self.processor = self._mimeview_processor
         if not self.processor:
             self.processor = self._default_processor
-            self.error = "No macro or processor named '%s' found" % name
+            self.error = _("No macro or processor named '%(name)s' found",
+                           name=name)
 
     # inline checks
 
@@ -327,14 +333,14 @@ class WikiProcessor(object):
     # generic processors
 
     def _legacy_macro_processor(self, text): # TODO: remove in 0.12
-        self.env.log.warning('Executing pre-0.11 Wiki macro %s by provider %s'
-                             % (self.name, self.macro_provider))
+        self.env.log.warning('Executing pre-0.11 Wiki macro %s by '
+                             'provider %s', self.name, self.macro_provider)
         return self.macro_provider.render_macro(self.formatter.req, self.name,
                                                 text)
 
     def _macro_processor(self, text):
-        self.env.log.debug('Executing Wiki macro %s by provider %s'
-                           % (self.name, self.macro_provider))
+        self.env.log.debug('Executing Wiki macro %s by provider %s',
+                           self.name, self.macro_provider)
         if arity(self.macro_provider.expand_macro) == 4:
             return self.macro_provider.expand_macro(self.formatter, self.name,
                                                     text, self.args)
@@ -349,8 +355,8 @@ class WikiProcessor(object):
 
     def process(self, text, in_paragraph=False):
         if self.error:
-            text = system_message(tag('Error: Failed to load processor ',
-                                      tag.code(self.name)),
+            text = system_message(tag_("Error: Failed to load processor "
+                                       "%(name)s", name=tag.code(self.name)),
                                   self.error)
         else:
             text = self.processor(text)
@@ -438,7 +444,7 @@ class Formatter(object):
         'MM_STRIKE': ('<del>', '</del>'),
         'MM_SUBSCRIPT': ('<sub>', '</sub>'),
         'MM_SUPERSCRIPT': ('<sup>', '</sup>'),
-        }
+    }
 
     def _get_open_tag(self, tag):
         """Retrieve opening tag for direct or indirect `tag`."""
@@ -477,12 +483,12 @@ class Formatter(object):
 
         If `close_tag` is not specified, it's an indirect tag (0.12)
         """
-        tmp =  ''
+        tmp = ''
         for i in xrange(len(self._open_tags) - 1, -1, -1):
             tag = self._open_tags[i]
             tmp += self._get_close_tag(tag)
             if (open_tag == tag,
-                (open_tag, close_tag) == tag)[bool(close_tag)]:
+                    (open_tag, close_tag) == tag)[bool(close_tag)]:
                 del self._open_tags[i]
                 for j in xrange(i, len(self._open_tags)):
                     tmp += self._get_open_tag(self._open_tags[j])
@@ -491,21 +497,42 @@ class Formatter(object):
 
     def _indirect_tag_handler(self, match, tag):
         """Handle binary inline style tags (indirect way, 0.12)"""
+        if self._list_stack and not self.in_list_item:
+            self.close_list()
+
         if self.tag_open_p(tag):
             return self.close_tag(tag)
         else:
             return self.open_tag(tag)
 
     def _bolditalic_formatter(self, match, fullmatch):
+        if self._list_stack and not self.in_list_item:
+            self.close_list()
+
+        bold_open = self.tag_open_p('MM_BOLD')
         italic_open = self.tag_open_p('MM_ITALIC')
-        tmp = ''
-        if italic_open:
-            tmp += self._get_close_tag('MM_ITALIC')
-            self.close_tag('MM_ITALIC')
-        tmp += self._bold_formatter(match, fullmatch)
-        if not italic_open:
-            tmp += self.open_tag('MM_ITALIC')
-        return tmp
+        if bold_open and italic_open:
+            bold_idx = self._open_tags.index('MM_BOLD')
+            italic_idx = self._open_tags.index('MM_ITALIC')
+            if italic_idx < bold_idx:
+                close_tags = ('MM_BOLD', 'MM_ITALIC')
+            else:
+                close_tags = ('MM_ITALIC', 'MM_BOLD')
+            open_tags = ()
+        elif bold_open:
+            close_tags = ('MM_BOLD',)
+            open_tags = ('MM_ITALIC',)
+        elif italic_open:
+            close_tags = ('MM_ITALIC',)
+            open_tags = ('MM_BOLD',)
+        else:
+            close_tags = ()
+            open_tags = ('MM_BOLD', 'MM_ITALIC')
+
+        tmp = []
+        tmp.extend(self.close_tag(tag) for tag in close_tags)
+        tmp.extend(self.open_tag(tag) for tag in open_tags)
+        return ''.join(tmp)
 
     def _bold_formatter(self, match, fullmatch):
         return self._indirect_tag_handler(match, 'MM_BOLD')
@@ -549,7 +576,7 @@ class Formatter(object):
 
     # -- Post- IWikiSyntaxProvider rules
 
-    # WikiCreole line brekas
+    # WikiCreole line breaks
 
     def _linebreak_wc_formatter(self, match, fullmatch):
         return '<br />'
@@ -575,7 +602,7 @@ class Formatter(object):
         ns = fullmatch.group('snsbr')
         target = unquote_label(fullmatch.group('stgtbr'))
         match = match[1:-1]
-        return '&lt;%s&gt;' % \
+        return u'&lt;%s&gt;' % \
                 self._make_link(ns, target, match, match, fullmatch)
 
     def _shref_formatter(self, match, fullmatch):
@@ -593,7 +620,7 @@ class Formatter(object):
     def _make_lhref_link(self, match, fullmatch, rel, ns, target, label):
         if not label: # e.g. `[http://target]` or `[wiki:target]`
             if target:
-                if target.startswith('//'):     # for `[http://target]`
+                if ns and target.startswith('//'):     # for `[http://target]`
                     label = ns + ':' + target   #  use `http://target`
                 else:                           # for `wiki:target`
                     label = target.lstrip('/')  #  use only `target`
@@ -701,7 +728,8 @@ class Formatter(object):
         interwiki = InterWikiMap(self.env)
         if ns in interwiki:
             url, title = interwiki.url(ns, target)
-            return self._make_ext_link(url, label, title)
+            if url:
+                return self._make_ext_link(url, label, title)
 
     def _make_ext_link(self, url, text, title=''):
         local_url = self.env.project_url or \
@@ -763,11 +791,13 @@ class Formatter(object):
             args = fullmatch.group('macroargs')
         try:
             return macro.ensure_inline(macro.process(args))
+        except MacroError, e:
+            return system_message(e)
         except Exception, e:
-            self.env.log.error('Macro %s(%s) failed: %s' %
-                    (name, args, exception_to_unicode(e, traceback=True)))
-            return system_message('Error: Macro %s(%s) failed' % (name, args),
-                                  e)
+            self.env.log.error('Macro %s(%s) failed:%s', name, args,
+                               exception_to_unicode(e, traceback=True))
+            return system_message(_("Error: Macro %(name)s(%(args)s) failed",
+                                    name=name, args=args), to_unicode(e))
 
     # Headings
 
@@ -838,12 +868,12 @@ class Formatter(object):
         else:
             type_ = 'ol'
             lstart = fullmatch.group('lstart')
-            start = None
-            idx = '0iI'.find(listid)
-            if idx > -1:
-                class_ = ('arabiczero', 'lowerroman', 'upperroman')[idx]
-            elif listid.isdigit():
-                start = lstart != '1' and int(lstart)
+            if listid == 'i':
+                class_ = 'lowerroman'
+            elif listid == 'I':
+                class_ = 'upperroman'
+            elif listid.isdigit() and lstart != '1':
+                start = int(lstart)
             elif listid.islower():
                 class_ = 'loweralpha'
                 if len(lstart) == 1 and lstart != 'a':
@@ -869,7 +899,7 @@ class Formatter(object):
             self._list_stack.append((new_type, depth))
             self._set_tab(depth)
             class_attr = ' class="%s"' % lclass if lclass else ''
-            start_attr = ' start="%s"' % start if start else ''
+            start_attr = ' start="%s"' % start if start is not None else ''
             self.out.write('<' + new_type + class_attr + start_attr + '><li>')
         def close_item():
             self.flush_tags()
@@ -1005,7 +1035,7 @@ class Formatter(object):
         if separator[-1] == '=':
             numpipes -= 1
             cell = 'th'
-        colspan = numpipes/2
+        colspan = numpipes / 2
         if is_last is not None:
             if is_last and is_last[-1] == '\\':
                 self.continue_table_row = 1
@@ -1131,7 +1161,8 @@ class Formatter(object):
                                          for l in self.code_buf]
                     self.code_buf.append('')
                 code_text = os.linesep.join(self.code_buf)
-                processed = self.code_processor.process(code_text)
+                processed = self._exec_processor(self.code_processor,
+                                                 code_text)
                 self.out.write(_markup_to_unicode(processed))
             else:
                 self.code_buf.append(line)
@@ -1151,6 +1182,15 @@ class Formatter(object):
     def close_code_blocks(self):
         while self.in_code_block > 0:
             self.handle_code_block(WikiParser.ENDBLOCK)
+
+    def _exec_processor(self, processor, text):
+        try:
+            return processor.process(text)
+        except Exception, e:
+            self.env.log.error('Processor %s failed:%s', processor.name,
+                               exception_to_unicode(e, traceback=True))
+            return system_message(_("Error: Processor %(name)s failed",
+                                    name=processor.name), to_unicode(e))
 
     # > quotes
 
@@ -1505,7 +1545,7 @@ class HtmlFormatter(object):
 class InlineHtmlFormatter(object):
     """Format parsed wiki text to inline elements HTML.
 
-    Block level content will be disguarded or compacted.
+    Block level content will be discarded or compacted.
     """
 
     flavor = 'oneliner'

@@ -1,18 +1,28 @@
 # -*- coding: utf-8 -*-
+#
+# Copyright (C) 2005-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
 
 from __future__ import with_statement
 
 from datetime import datetime
-import os.path
-import shutil
 from StringIO import StringIO
 import tempfile
 import unittest
 
+import trac.tests.compat
 from trac.attachment import Attachment
 from trac.core import *
+from trac.resource import Resource
 from trac.test import EnvironmentStub
-from trac.tests.resource import TestResourceChangeListener
 from trac.util.datefmt import utc, to_utimestamp
 from trac.wiki import WikiPage, IWikiChangeListener
 
@@ -31,8 +41,8 @@ class TestWikiChangeListener(Component):
     def wiki_page_added(self, page):
         self.added.append(page)
 
-    def wiki_page_changed(self, page, version, t, comment, author, ipnr):
-        self.changed.append((page, version, t, comment, author, ipnr))
+    def wiki_page_changed(self, page, version, t, comment, author):
+        self.changed.append((page, version, t, comment, author))
 
     def wiki_page_deleted(self, page):
         self.deleted.append(page)
@@ -44,27 +54,31 @@ class TestWikiChangeListener(Component):
         self.renamed.append((page, old_name))
 
 
+class TestLegacyWikiChangeListener(TestWikiChangeListener):
+
+    def wiki_page_changed(self, page, version, t, comment, author, ipnr):
+        self.changed.append((page, version, t, comment, author, ipnr))
+
+
 class WikiPageTestCase(unittest.TestCase):
 
     def setUp(self):
         self.env = EnvironmentStub()
-        self.env.path = os.path.join(tempfile.gettempdir(), 'trac-tempenv')
-        os.mkdir(self.env.path)
+        self.env.path = tempfile.mkdtemp(prefix='trac-tempenv-')
 
     def tearDown(self):
-        shutil.rmtree(self.env.path)
-        self.env.reset_db()
+        self.env.reset_db_and_disk()
 
     def test_new_page(self):
         page = WikiPage(self.env)
-        self.assertEqual(False, page.exists)
-        self.assertEqual(None, page.name)
+        self.assertFalse(page.exists)
+        self.assertIsNone(page.name)
         self.assertEqual(0, page.version)
         self.assertEqual('', page.text)
         self.assertEqual(0, page.readonly)
         self.assertEqual('', page.author)
         self.assertEqual('', page.comment)
-        self.assertEqual(None, page.time)
+        self.assertIsNone(page.time)
 
     def test_existing_page(self):
         t = datetime(2001, 1, 1, 1, 1, 1, 0, utc)
@@ -74,10 +88,10 @@ class WikiPageTestCase(unittest.TestCase):
              'Testing', 0))
 
         page = WikiPage(self.env, 'TestPage')
-        self.assertEqual(True, page.exists)
+        self.assertTrue(page.exists)
         self.assertEqual('TestPage', page.name)
         self.assertEqual(1, page.version)
-        self.assertEqual(None, page.resource.version)   # FIXME: Intentional?
+        self.assertIsNone(page.resource.version)   # FIXME: Intentional?
         self.assertEqual('Bla bla', page.text)
         self.assertEqual(0, page.readonly)
         self.assertEqual('joe', page.author)
@@ -90,6 +104,11 @@ class WikiPageTestCase(unittest.TestCase):
 
         page = WikiPage(self.env, 'TestPage', 1)
         self.assertEqual(1, page.resource.version)
+        self.assertEqual(1, page.version)
+
+        resource = Resource('wiki', 'TestPage')
+        page = WikiPage(self.env, resource, 1)
+        self.assertEqual(1, page.version)
 
     def test_create_page(self):
         page = WikiPage(self.env)
@@ -98,7 +117,7 @@ class WikiPageTestCase(unittest.TestCase):
         t = datetime(2001, 1, 1, 1, 1, 1, 0, utc)
         page.save('joe', 'Testing', '::1', t)
 
-        self.assertEqual(True, page.exists)
+        self.assertTrue(page.exists)
         self.assertEqual(1, page.version)
         self.assertEqual(1, page.resource.version)
         self.assertEqual(0, page.readonly)
@@ -138,7 +157,7 @@ class WikiPageTestCase(unittest.TestCase):
         with self.env.db_query as db:
             rows = db("""
                SELECT version, time, author, ipnr, text, comment, readonly
-               FROM wiki WHERE name=%s
+               FROM wiki WHERE name=%s ORDER BY version
                """, ('TestPage',))
             self.assertEqual(2, len(rows))
             self.assertEqual((1, to_utimestamp(t), 'joe', '::1', 'Bla bla',
@@ -146,8 +165,11 @@ class WikiPageTestCase(unittest.TestCase):
             self.assertEqual((2, to_utimestamp(t2), 'kate', '192.168.0.101',
                               'Bla', 'Changing', 0), rows[1])
 
-        listener = TestWikiChangeListener(self.env)
+        listener = TestLegacyWikiChangeListener(self.env)
         self.assertEqual((page, 2, t2, 'Changing', 'kate', '192.168.0.101'),
+                         listener.changed[0])
+        listener = TestWikiChangeListener(self.env)
+        self.assertEqual((page, 2, t2, 'Changing', 'kate'),
                          listener.changed[0])
 
         page = WikiPage(self.env, 'TestPage')
@@ -165,7 +187,7 @@ class WikiPageTestCase(unittest.TestCase):
         page = WikiPage(self.env, 'TestPage')
         page.delete()
 
-        self.assertEqual(False, page.exists)
+        self.assertFalse(page.exists)
 
         self.assertEqual([], self.env.db_query("""
             SELECT version, time, author, ipnr, text, comment, readonly
@@ -184,7 +206,7 @@ class WikiPageTestCase(unittest.TestCase):
         page = WikiPage(self.env, 'TestPage')
         page.delete(version=2)
 
-        self.assertEqual(True, page.exists)
+        self.assertTrue(page.exists)
         self.assertEqual(
             [(1, 42, 'joe', '::1', 'Bla bla', 'Testing', 0)],
             self.env.db_query("""
@@ -203,7 +225,7 @@ class WikiPageTestCase(unittest.TestCase):
         page = WikiPage(self.env, 'TestPage')
         page.delete(version=1)
 
-        self.assertEqual(False, page.exists)
+        self.assertFalse(page.exists)
 
         self.assertEqual([], self.env.db_query("""
             SELECT version, time, author, ipnr, text, comment, readonly
@@ -224,6 +246,7 @@ class WikiPageTestCase(unittest.TestCase):
         page = WikiPage(self.env, 'TestPage')
         page.rename('PageRenamed')
         self.assertEqual('PageRenamed', page.name)
+        self.assertEqual('PageRenamed', page.resource.id)
 
         self.assertEqual([data], self.env.db_query("""
             SELECT version, time, author, ipnr, text, comment, readonly
@@ -236,8 +259,7 @@ class WikiPageTestCase(unittest.TestCase):
         Attachment.delete_all(self.env, 'wiki', 'PageRenamed')
 
         old_page = WikiPage(self.env, 'TestPage')
-        self.assertEqual(False, old_page.exists)
-
+        self.assertFalse(old_page.exists)
 
         self.assertEqual([], self.env.db_query("""
             SELECT version, time, author, ipnr, text, comment, readonly
@@ -267,77 +289,26 @@ class WikiPageTestCase(unittest.TestCase):
             page = WikiPage(self.env, 'TestPage')
             self.assertRaises(TracError, page.rename, name)
 
-class WikiResourceChangeListenerTestCase(unittest.TestCase):
-    INITIAL_NAME = "Wiki page 1"
-    INITIAL_TEXT = "some text"
-    INITIAL_AUTHOR = "anAuthor"
-    INITIAL_COMMENT = "some comment"
-    INITIAL_REMOTE_ADDRESS = "::1"
+    def test_invalid_version(self):
+        data = (1, 42, 'joe', '::1', 'Bla bla', 'Testing', 0)
+        self.env.db_transaction(
+            "INSERT INTO wiki VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
+            ('TestPage',) + data)
 
-    def setUp(self):
-        self.env = EnvironmentStub(default_data=True)
-        self.listener = TestResourceChangeListener(self.env)
-        self.listener.resource_type = WikiPage
-        self.listener.callback = self.listener_callback
+        self.assertRaises(ValueError, WikiPage, self.env,
+                          'TestPage', '1abc')
 
-    def tearDown(self):
-        self.env.reset_db()
+        resource = Resource('wiki', 'TestPage')
+        self.assertRaises(ValueError, WikiPage, self.env,
+                          resource, '1abc')
 
-    def test_change_listener_created(self):
-        self._create_wiki_page(self.INITIAL_NAME)
-        self.assertEqual('created', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, WikiPage))
-        self.assertEqual(self.INITIAL_NAME, self.wiki_name)
-        self.assertEqual(self.INITIAL_TEXT, self.wiki_text)
+        resource = Resource('wiki', 'TestPage', '1abc')
+        page = WikiPage(self.env, resource)
+        self.assertEqual(1, page.version)
 
-    def test_change_listener_text_changed(self):
-        wiki_page = self._create_wiki_page(self.INITIAL_NAME)
-        CHANGED_TEXT = "some other text"
-        wiki_page.text = CHANGED_TEXT
-        wiki_page.save("author1", "renamed_comment", "::2")
-        self.assertEqual('changed', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, WikiPage))
-        self.assertEqual(self.INITIAL_NAME, self.wiki_name)
-        self.assertEqual(CHANGED_TEXT, self.wiki_text)
-        self.assertEqual({"text":self.INITIAL_TEXT}, self.listener.old_values)
-
-    def test_change_listener_renamed(self):
-        wiki_page = self._create_wiki_page(self.INITIAL_NAME)
-        CHANGED_NAME = "NewWikiName"
-        wiki_page.rename(CHANGED_NAME)
-        self.assertEqual('changed', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, WikiPage))
-        self.assertEqual(CHANGED_NAME, self.wiki_name)
-        self.assertEqual(self.INITIAL_TEXT, self.wiki_text)
-        self.assertEqual({"name":self.INITIAL_NAME}, self.listener.old_values)
-
-    def test_change_listener_deleted(self):
-        wiki_page = self._create_wiki_page(self.INITIAL_NAME)
-        wiki_page.delete()
-        self.assertEqual('deleted', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, WikiPage))
-        self.assertEqual(self.INITIAL_NAME, self.wiki_name)
-
-    def _create_wiki_page(self, name=None):
-        name = name or self.INITIAL_NAME
-        wiki_page = WikiPage(self.env, name)
-        wiki_page.text = self.INITIAL_TEXT
-        wiki_page.save(
-            self.INITIAL_AUTHOR,
-            self.INITIAL_COMMENT,
-            self.INITIAL_REMOTE_ADDRESS)
-        return wiki_page
-
-    def listener_callback(self, action, resource, context, old_values = None):
-        self.wiki_name = resource.name
-        self.wiki_text = resource.text
 
 def suite():
-    suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(WikiPageTestCase, 'test'))
-    suite.addTest(unittest.makeSuite(
-        WikiResourceChangeListenerTestCase, 'test'))
-    return suite
+    return unittest.makeSuite(WikiPageTestCase)
 
 if __name__ == '__main__':
     unittest.main(defaultTest='suite')

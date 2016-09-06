@@ -20,42 +20,17 @@ from collections import deque
 from contextlib import contextmanager
 import cStringIO
 from functools import partial
-from operator import itemgetter
 import re
 from subprocess import Popen, PIPE
-import sys
 from threading import Lock
-import time
 import weakref
 
+from trac.util import terminate
+from trac.util.compat import close_fds
+from trac.util.datefmt import time_now
+from trac.util.text import to_unicode
 
 __all__ = ['GitError', 'GitErrorSha', 'Storage', 'StorageFactory']
-
-
-def terminate(process):
-    """Python 2.5 compatibility method.
-    os.kill is not available on Windows before Python 2.7.
-    In Python 2.6 subprocess.Popen has a terminate method.
-    (It also seems to have some issues on Windows though.)
-    """
-
-    def terminate_win(process):
-        import ctypes
-        PROCESS_TERMINATE = 1
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE,
-                                                    False,
-                                                    process.pid)
-        ctypes.windll.kernel32.TerminateProcess(handle, -1)
-        ctypes.windll.kernel32.CloseHandle(handle)
-
-    def terminate_nix(process):
-        import os
-        import signal
-        return os.kill(process.pid, signal.SIGTERM)
-
-    if sys.platform == 'win32':
-        return terminate_win(process)
-    return terminate_nix(process)
 
 
 class GitError(Exception):
@@ -95,12 +70,38 @@ def parse_commit(raw):
     return '\n'.join(lines), props
 
 
+_unquote_re = re.compile(r'\\(?:[abtnvfr"\\]|[0-7]{3})')
+_unquote_chars = {'a': '\a', 'b': '\b', 't': '\t', 'n': '\n', 'v': '\v',
+                  'f': '\f', 'r': '\r', '"': '"', '\\': '\\'}
+
+
+def _unquote(path):
+    if path.startswith('"') and path.endswith('"'):
+        def replace(match):
+            s = match.group(0)[1:]
+            if len(s) == 3:
+                return chr(int(s, 8))  # \ooo
+            return _unquote_chars[s]
+        path = _unquote_re.sub(replace, path[1:-1])
+    return path
+
+
+def _close_proc_pipes(proc):
+    if proc:
+        for f in (proc.stdin, proc.stdout, proc.stderr):
+            if f:
+                f.close()
+
+
 class GitCore(object):
     """Low-level wrapper around git executable"""
 
-    def __init__(self, git_dir=None, git_bin='git'):
+    def __init__(self, git_dir=None, git_bin='git', log=None,
+                 fs_encoding=None):
         self.__git_bin = git_bin
         self.__git_dir = git_dir
+        self.__log = log
+        self.__fs_encoding = fs_encoding
 
     def __repr__(self):
         return '<GitCore bin="%s" dir="%s">' % (self.__git_bin,
@@ -115,14 +116,28 @@ class GitCore(object):
         cmd.append(gitcmd)
         cmd.extend(args)
 
+        fs_encoding = self.__fs_encoding
+        if fs_encoding is not None:
+            if os.name == 'nt':
+                # For Windows, Popen() accepts only ANSI encoding
+                def to_cmd_encoding(arg):
+                    if not isinstance(arg, unicode):
+                        arg = arg.decode(fs_encoding, 'replace')
+                    return arg.encode('mbcs', 'replace')
+            else:
+                def to_cmd_encoding(arg):
+                    if isinstance(arg, unicode):
+                        arg = arg.encode(fs_encoding, 'replace')
+                    return arg
+            cmd = map(to_cmd_encoding, cmd)
         return cmd
 
     def __pipe(self, git_cmd, *cmd_args, **kw):
-        if sys.platform == 'win32':
-            return Popen(self.__build_git_cmd(git_cmd, *cmd_args), **kw)
-        else:
-            return Popen(self.__build_git_cmd(git_cmd, *cmd_args),
-                         close_fds=True, **kw)
+        kw.setdefault('stdin', PIPE)
+        kw.setdefault('stdout', PIPE)
+        kw.setdefault('stderr', PIPE)
+        return Popen(self.__build_git_cmd(git_cmd, *cmd_args),
+                     close_fds=close_fds, **kw)
 
     def __execute(self, git_cmd, *cmd_args):
         """execute git command and return file-like object of stdout"""
@@ -130,9 +145,12 @@ class GitCore(object):
         #print >>sys.stderr, "DEBUG:", git_cmd, cmd_args
 
         p = self.__pipe(git_cmd, stdout=PIPE, stderr=PIPE, *cmd_args)
-
         stdout_data, stderr_data = p.communicate()
-        #TODO, do something with p.returncode, e.g. raise exception
+        _close_proc_pipes(p)
+        if self.__log and (p.returncode != 0 or stderr_data):
+            self.__log.debug('%s exits with %d, dir: %r, args: %s %r, '
+                             'stderr: %r', self.__git_bin, p.returncode,
+                             self.__git_dir, git_cmd, cmd_args, stderr_data)
 
         return stdout_data
 
@@ -188,44 +206,57 @@ class SizedDict(dict):
             return rc
 
     def setdefault(self, *_):
-        raise NotImplemented("SizedDict has no setdefault() method")
+        raise NotImplementedError("SizedDict has no setdefault() method")
 
 
 class StorageFactory(object):
     __dict = weakref.WeakValueDictionary()
-    __dict_nonweak = dict()
+    __dict_nonweak = {}
+    __dict_rev_cache = {}
     __dict_lock = Lock()
 
     def __init__(self, repo, log, weak=True, git_bin='git',
                  git_fs_encoding=None):
         self.logger = log
 
-        with StorageFactory.__dict_lock:
+        with self.__dict_lock:
+            if weak:
+                # remove additional reference which is created
+                # with non-weak argument
+                try:
+                    del self.__dict_nonweak[repo]
+                except KeyError:
+                    pass
             try:
-                i = StorageFactory.__dict[repo]
+                i = self.__dict[repo]
             except KeyError:
-                i = Storage(repo, log, git_bin, git_fs_encoding)
-                StorageFactory.__dict[repo] = i
+                rev_cache = self.__dict_rev_cache.get(repo)
+                i = Storage(repo, log, git_bin, git_fs_encoding, rev_cache)
+                self.__dict[repo] = i
 
-                # create or remove additional reference depending on 'weak'
-                # argument
-                if weak:
-                    try:
-                        del StorageFactory.__dict_nonweak[repo]
-                    except KeyError:
-                        pass
-                else:
-                    StorageFactory.__dict_nonweak[repo] = i
+            # create additional reference depending on 'weak' argument
+            if not weak:
+                self.__dict_nonweak[repo] = i
 
         self.__inst = i
-        self.__repo = repo
+        self.logger.debug("requested %s PyGIT.Storage instance for '%s'",
+                          'weak' if weak else 'non-weak', repo)
 
     def getInstance(self):
-        is_weak = self.__repo not in StorageFactory.__dict_nonweak
-        self.logger.debug("requested %sPyGIT.Storage instance %d for '%s'"
-                          % (("","weak ")[is_weak], id(self.__inst),
-                             self.__repo))
         return self.__inst
+
+    @classmethod
+    def set_rev_cache(cls, repo, rev_cache):
+        with cls.__dict_lock:
+            cls.__dict_rev_cache[repo] = rev_cache
+
+    @classmethod
+    def _clean(cls):
+        """For testing purpose only"""
+        with cls.__dict_lock:
+            cls.__dict.clear()
+            cls.__dict_nonweak.clear()
+            cls.__dict_rev_cache.clear()
 
 
 class Storage(object):
@@ -233,68 +264,48 @@ class Storage(object):
 
     __SREV_MIN = 4 # minimum short-rev length
 
+    class RevCache(object):
 
-    class RevCache(tuple):
-        """RevCache(youngest_rev, oldest_rev, rev_dict, tag_set, srev_dict,
-                    branch_dict)
+        __slots__ = ('youngest_rev', 'oldest_rev', 'rev_dict', 'refs_dict',
+                     'srev_dict')
 
-        In Python 2.7 this class could be defined by:
-            from collections import namedtuple
-            RevCache = namedtuple('RevCache', 'youngest_rev oldest_rev '
-                                              'rev_dict tag_set srev_dict '
-                                              'branch_dict')
-        This implementation is what that code generator would produce.
-        """
-
-        __slots__ = ()
-
-        _fields = ('youngest_rev', 'oldest_rev', 'rev_dict', 'tag_set',
-                   'srev_dict', 'branch_dict')
-
-        def __new__(cls, youngest_rev, oldest_rev, rev_dict, tag_set,
-                    srev_dict, branch_dict):
-            return tuple.__new__(cls, (youngest_rev, oldest_rev, rev_dict,
-                                 tag_set, srev_dict, branch_dict))
+        def __init__(self, youngest_rev, oldest_rev, rev_dict, refs_dict,
+                     srev_dict):
+            self.youngest_rev = youngest_rev
+            self.oldest_rev = oldest_rev
+            self.rev_dict = rev_dict
+            self.refs_dict = refs_dict
+            self.srev_dict = srev_dict
+            if youngest_rev is not None and oldest_rev is not None and \
+                    rev_dict and refs_dict and srev_dict:
+                pass  # all fields are not empty
+            elif not youngest_rev and not oldest_rev and \
+                    not rev_dict and not refs_dict and not srev_dict:
+                pass  # all fields are empty
+            else:
+                raise ValueError('Invalid RevCache fields: %r' % self)
 
         @classmethod
-        def _make(cls, iterable, new=tuple.__new__, len=len):
-            """Make a new RevCache object from a sequence or iterable"""
-            result = new(cls, iterable)
-            if len(result) != 6:
-                raise TypeError('Expected 6 arguments, got %d' % len(result))
-            return result
+        def empty(cls):
+            return cls(None, None, {}, {}, {})
 
         def __repr__(self):
-            return 'RevCache(youngest_rev=%r, oldest_rev=%r, rev_dict=%r, ' \
-                   'tag_set=%r, srev_dict=%r, branch_dict=%r)' % self
+            return 'RevCache(youngest_rev=%r, oldest_rev=%r, ' \
+                   'rev_dict=%d entries, refs_dict=%d entries, ' \
+                   'srev_dict=%d entries)' % \
+                   (self.youngest_rev, self.oldest_rev, len(self.rev_dict),
+                    len(self.refs_dict), len(self.srev_dict))
 
-        def _asdict(t):
-            """Return a new dict which maps field names to their values"""
-            return {'youngest_rev': t[0], 'oldest_rev': t[1],
-                    'rev_dict': t[2], 'tag_set': t[3], 'srev_dict': t[4],
-                    'branch_dict': t[5]}
+        def iter_branches(self):
+            head = self.refs_dict.get('HEAD')
+            for refname, rev in self.refs_dict.iteritems():
+                if refname.startswith('refs/heads/'):
+                    yield refname[11:], rev, refname == head
 
-        def _replace(self, **kwds):
-            """Return a new RevCache object replacing specified fields with
-            new values
-            """
-            result = self._make(map(kwds.pop, ('youngest_rev', 'oldest_rev',
-                'rev_dict', 'tag_set', 'srev_dict', 'branch_dict'), self))
-            if kwds:
-                raise ValueError("Got unexpected field names: %r"
-                                 % kwds.keys())
-            return result
-
-        def __getnewargs__(self):
-            return tuple(self)
-
-        youngest_rev = property(itemgetter(0))
-        oldest_rev = property(itemgetter(1))
-        rev_dict = property(itemgetter(2))
-        tag_set = property(itemgetter(3))
-        srev_dict = property(itemgetter(4))
-        branch_dict = property(itemgetter(5))
-
+        def iter_tags(self):
+            for refname, rev in self.refs_dict.iteritems():
+                if refname.startswith('refs/tags/'):
+                    yield refname[10:], rev
 
     @staticmethod
     def __rev_key(rev):
@@ -338,7 +349,8 @@ class Storage(object):
                            "execute/parse '%s --version' but got %s)"
                            % (git_bin, repr(e)))
 
-    def __init__(self, git_dir, log, git_bin='git', git_fs_encoding=None):
+    def __init__(self, git_dir, log, git_bin='git', git_fs_encoding=None,
+                 rev_cache=None):
         """Initialize PyGit.Storage instance
 
         `git_dir`: path to .git folder;
@@ -360,7 +372,8 @@ class Storage(object):
         self.commit_encoding = None
 
         # caches
-        self.__rev_cache = None
+        self.__rev_cache = rev_cache or self.RevCache.empty()
+        self.__rev_cache_refresh = True
         self.__rev_cache_lock = Lock()
 
         # cache the last 200 commit messages
@@ -375,7 +388,8 @@ class Storage(object):
             codecs.lookup(git_fs_encoding)
 
             # setup conversion functions
-            self._fs_to_unicode = lambda s: s.decode(git_fs_encoding)
+            self._fs_to_unicode = lambda s: s.decode(git_fs_encoding,
+                                                     'replace')
             self._fs_from_unicode = lambda s: s.encode(git_fs_encoding)
         else:
             # pass bytestrings as-is w/o any conversion
@@ -383,203 +397,204 @@ class Storage(object):
 
         # simple sanity checking
         __git_file_path = partial(os.path.join, git_dir)
-        if not all(map(os.path.exists,
-                       map(__git_file_path,
-                           ['HEAD','objects','refs']))):
-            self.logger.error("GIT control files missing in '%s'" % git_dir)
-            if os.path.exists(__git_file_path('.git')):
-                self.logger.error("entry '.git' found in '%s'"
-                                  " -- maybe use that folder instead..."
+        control_files = ['HEAD', 'objects', 'refs']
+        control_files_exist = \
+            lambda p: all(map(os.path.exists, map(p, control_files)))
+        if not control_files_exist(__git_file_path):
+            __git_file_path = partial(os.path.join, git_dir, '.git')
+            if os.path.exists(__git_file_path()) and \
+                    control_files_exist(__git_file_path):
+                git_dir = __git_file_path()
+            else:
+                self.logger.error("GIT control files missing in '%s'"
                                   % git_dir)
-            raise GitError("GIT control files not found, maybe wrong "
-                           "directory?")
+                raise GitError("GIT control files not found, maybe wrong "
+                               "directory?")
+        # at least, check that the HEAD file is readable
+        head_file = os.path.join(git_dir, 'HEAD')
+        try:
+            with open(head_file, 'rb'):
+                pass
+        except IOError, e:
+            raise GitError("Make sure the Git repository '%s' is readable: %s"
+                           % (git_dir, to_unicode(e)))
 
-        self.repo = GitCore(git_dir, git_bin=git_bin)
+        self.repo = GitCore(git_dir, git_bin, log, git_fs_encoding)
+        self.repo_path = git_dir
 
-        self.logger.debug("PyGIT.Storage instance %d constructed" % id(self))
+        self.logger.debug("PyGIT.Storage instance for '%s' is constructed",
+                          git_dir)
+
+    def _cleanup_proc(self, proc):
+        if proc:
+            _close_proc_pipes(proc)
+            terminate(proc)
+            proc.wait()
 
     def __del__(self):
         with self.__cat_file_pipe_lock:
-            if self.__cat_file_pipe is not None:
-                self.__cat_file_pipe.stdin.close()
-                terminate(self.__cat_file_pipe)
-                self.__cat_file_pipe.wait()
+            self._cleanup_proc(self.__cat_file_pipe)
 
     #
     # cache handling
     #
 
-    # called by Storage.sync()
-    def __rev_cache_sync(self, youngest_rev=None):
-        """invalidates revision db cache if necessary"""
-
+    def invalidate_rev_cache(self):
         with self.__rev_cache_lock:
-            need_update = False
-            if self.__rev_cache:
-                last_youngest_rev = self.__rev_cache.youngest_rev
-                if last_youngest_rev != youngest_rev:
-                    self.logger.debug("invalidated caches (%s != %s)"
-                                      % (last_youngest_rev, youngest_rev))
-                    need_update = True
-            else:
-                need_update = True # almost NOOP
+            self.__rev_cache_refresh = True
 
-            if need_update:
-                self.__rev_cache = None
-
-            return need_update
-
-    def get_rev_cache(self):
+    @property
+    def rev_cache(self):
         """Retrieve revision cache
 
         may rebuild cache on the fly if required
 
         returns RevCache tuple
         """
-
         with self.__rev_cache_lock:
-            if self.__rev_cache is None:
-                # can be cleared by Storage.__rev_cache_sync()
-                self.logger.debug("triggered rebuild of commit tree db "
-                                  "for %d" % id(self))
-                ts0 = time.time()
-
-                youngest = None
-                oldest = None
-                new_db = {} # db
-                new_sdb = {} # short_rev db
-
-                # helper for reusing strings
-                __rev_seen = {}
-                def __rev_reuse(rev):
-                    rev = str(rev)
-                    return __rev_seen.setdefault(rev, rev)
-
-                new_tags = set(__rev_reuse(rev.strip())
-                               for rev in self.repo.rev_parse('--tags')
-                                                   .splitlines())
-
-                new_branches = [(k, __rev_reuse(v))
-                                for k, v in self._get_branches()]
-                head_revs = set(v for _, v in new_branches)
-
-                rev = ord_rev = 0
-                for ord_rev, revs in enumerate(
-                                        self.repo.rev_list('--parents',
-                                                           '--topo-order',
-                                                           '--all')
-                                                 .splitlines()):
-                    revs = map(__rev_reuse, revs.strip().split())
-
-                    rev = revs[0]
-
-                    # first rev seen is assumed to be the youngest one
-                    if not ord_rev:
-                        youngest = rev
-
-                    # shortrev "hash" map
-                    srev_key = self.__rev_key(rev)
-                    new_sdb.setdefault(srev_key, []).append(rev)
-
-                    # parents
-                    parents = tuple(revs[1:])
-
-                    # new_db[rev] = (children(rev), parents(rev),
-                    #                ordinal_id(rev), rheads(rev))
-                    if rev in new_db:
-                        # (incomplete) entry was already created by children
-                        _children, _parents, _ord_rev, _rheads = new_db[rev]
-                        assert _children
-                        assert not _parents
-                        assert _ord_rev == 0
-
-                        if rev in head_revs and rev not in _rheads:
-                            _rheads.append(rev)
-
-                    else: # new entry
-                        _children = []
-                        _rheads = [rev] if rev in head_revs else []
-
-                    # create/update entry
-                    # transform lists into tuples since entry will be final
-                    new_db[rev] = tuple(_children), tuple(parents), \
-                                  ord_rev + 1, tuple(_rheads)
-
-                    # update parents(rev)s
-                    for parent in parents:
-                        # by default, a dummy ordinal_id is used
-                        # for the mean-time
-                        _children, _parents, _ord_rev, _rheads2 = \
-                            new_db.setdefault(parent, ([], [], 0, []))
-
-                        # update parent(rev)'s children
-                        if rev not in _children:
-                            _children.append(rev)
-
-                        # update parent(rev)'s rheads
-                        for rev in _rheads:
-                            if rev not in _rheads2:
-                                _rheads2.append(rev)
-
-                # last rev seen is assumed to be the oldest
-                # one (with highest ord_rev)
-                oldest = rev
-
-                __rev_seen = None
-
-                # convert sdb either to dict or array depending on size
-                tmp = [()]*(max(new_sdb.keys())+1) \
-                      if len(new_sdb) > 5000 else {}
-
-                try:
-                    while True:
-                        k, v = new_sdb.popitem()
-                        tmp[k] = tuple(v)
-                except KeyError:
-                    pass
-
-                assert len(new_sdb) == 0
-                new_sdb = tmp
-
-                # atomically update self.__rev_cache
-                self.__rev_cache = Storage.RevCache(youngest, oldest, new_db,
-                                                    new_tags, new_sdb,
-                                                    new_branches)
-                ts1 = time.time()
-                self.logger.debug("rebuilt commit tree db for %d with %d "
-                                  "entries (took %.1f ms)"
-                                  % (id(self), len(new_db), 1000*(ts1-ts0)))
-
-            assert all(e is not None for e in self.__rev_cache) \
-                   or not any(self.__rev_cache)
-
+            self._refresh_rev_cache()
             return self.__rev_cache
-        # with self.__rev_cache_lock
 
-    # see RevCache namedtuple
-    rev_cache = property(get_rev_cache)
-
-    def _get_branches(self):
-        """returns list of (local) branches, with active (= HEAD) one being
-        the first item
-        """
-
-        result = []
-        for e in self.repo.branch('-v', '--no-abbrev').splitlines():
-            bname, bsha = e[1:].strip().split()[:2]
-            if e.startswith('*'):
-                result.insert(0, (bname, bsha))
+    def _refresh_rev_cache(self, force=False):
+        refreshed = False
+        if force or self.__rev_cache_refresh:
+            self.__rev_cache_refresh = False
+            refs = self._get_refs()
+            if self.__rev_cache.refs_dict != refs:
+                self.logger.debug("Detected changes in git repository "
+                                  "'%s'", self.repo_path)
+                rev_cache = self._build_rev_cache(refs)
+                self.__rev_cache = rev_cache
+                StorageFactory.set_rev_cache(self.repo_path, rev_cache)
+                refreshed = True
             else:
-                result.append((bname, bsha))
+                self.logger.debug("Detected no changes in git repository "
+                                  "'%s'", self.repo_path)
+        return refreshed
 
-        return result
+    def _build_rev_cache(self, refs):
+        self.logger.debug("triggered rebuild of commit tree db for '%s'",
+                          self.repo_path)
+        ts0 = time_now()
+
+        new_db = {} # db
+        new_sdb = {} # short_rev db
+
+        # helper for reusing strings
+        revs_seen = {}
+        def _rev_reuse(rev):
+            return revs_seen.setdefault(rev, rev)
+
+        refs = dict((refname, _rev_reuse(rev))
+                    for refname, rev in refs.iteritems())
+        head_revs = set(rev for refname, rev in refs.iteritems()
+                            if refname.startswith('refs/heads/'))
+        rev_list = [map(_rev_reuse, line.split())
+                    for line in self.repo.rev_list('--parents', '--topo-order',
+                                                   '--all').splitlines()]
+        revs_seen = None
+
+        if rev_list:
+            # first rev seen is assumed to be the youngest one
+            youngest = rev_list[0][0]
+            # last rev seen is assumed to be the oldest one
+            oldest = rev_list[-1][0]
+        else:
+            youngest = oldest = None
+
+        rheads_seen = {}
+        def _rheads_reuse(rheads):
+            rheads = frozenset(rheads)
+            return rheads_seen.setdefault(rheads, rheads)
+
+        __rev_key = self.__rev_key
+        for ord_rev, revs in enumerate(rev_list):
+            rev = revs[0]
+            parents = revs[1:]
+
+            # shortrev "hash" map
+            new_sdb.setdefault(__rev_key(rev), []).append(rev)
+
+            # new_db[rev] = (children(rev), parents(rev),
+            #                ordinal_id(rev), rheads(rev))
+            if rev in new_db:
+                # (incomplete) entry was already created by children
+                _children, _parents, _ord_rev, _rheads = new_db[rev]
+                assert _children
+                assert not _parents
+                assert _ord_rev == 0
+            else: # new entry
+                _children = set()
+                _rheads = set()
+            if rev in head_revs:
+                _rheads.add(rev)
+
+            # create/update entry
+            # transform into frozenset and tuple since entry will be final
+            new_db[rev] = (frozenset(_children), tuple(parents), ord_rev + 1,
+                           _rheads_reuse(_rheads))
+
+            # update parents(rev)s
+            for parent in parents:
+                # by default, a dummy ordinal_id is used for the mean-time
+                _children, _parents, _ord_rev, _rheads2 = \
+                    new_db.setdefault(parent, (set(), [], 0, set()))
+
+                # update parent(rev)'s children
+                _children.add(rev)
+
+                # update parent(rev)'s rheads
+                _rheads2.update(_rheads)
+
+        rheads_seen = None
+
+        # convert sdb either to dict or array depending on size
+        tmp = [()] * (max(new_sdb.keys()) + 1) if len(new_sdb) > 5000 else {}
+        try:
+            while True:
+                k, v = new_sdb.popitem()
+                tmp[k] = tuple(v)
+        except KeyError:
+            pass
+        assert len(new_sdb) == 0
+        new_sdb = tmp
+
+        rev_cache = self.RevCache(youngest, oldest, new_db, refs, new_sdb)
+        self.logger.debug("rebuilt commit tree db for '%s' with %d entries "
+                          "(took %.1f ms)", self.repo_path, len(new_db),
+                          1000 * (time_now() - ts0))
+        return rev_cache
+
+    def _get_refs(self):
+        refs = {}
+        tags = {}
+
+        for line in self.repo.show_ref('--dereference').splitlines():
+            if ' ' not in line:
+                continue
+            rev, refname = line.split(' ', 1)
+            if refname.endswith('^{}'):  # derefered tag
+                tags[refname[:-3]] = rev
+            else:
+                refs[refname] = rev
+        refs.update(tags.iteritems())
+
+        if refs:
+            refname = (self.repo.symbolic_ref('-q', 'HEAD') or '').strip()
+            if refname in refs:
+                refs['HEAD'] = refname
+
+        return refs
 
     def get_branches(self):
         """returns list of (local) branches, with active (= HEAD) one being
         the first item
         """
-        return ((self._fs_to_unicode(name), sha)
-                for name, sha in self.rev_cache.branch_dict)
+        branches = sorted(((self._fs_to_unicode(name), rev, head)
+                           for name, rev, head
+                           in self.rev_cache.iter_branches()),
+                          key=lambda (name, rev, head): (not head, name))
+        return [(name, rev) for name, rev, head in branches]
 
     def get_commits(self):
         return self.rev_cache.rev_dict
@@ -605,10 +620,11 @@ class Storage(object):
             return []
 
         if resolve:
-            return ((self._fs_to_unicode(k), v)
-                    for k, v in _rev_cache.branch_dict if v in rheads)
-
-        return rheads
+            return sorted((self._fs_to_unicode(name), rev)
+                          for name, rev, head in _rev_cache.iter_branches()
+                          if rev in rheads)
+        else:
+            return list(rheads)
 
     def history_relative_rev(self, sha, rel_pos):
         db = self.get_commits()
@@ -640,8 +656,8 @@ class Storage(object):
     def get_commit_encoding(self):
         if self.commit_encoding is None:
             self.commit_encoding = \
-                self.repo.repo_config("--get", "i18n.commitEncoding") \
-                    .strip() or 'utf-8'
+                self.repo.config('--get', 'i18n.commitEncoding').strip() or \
+                'utf-8'
 
         return self.commit_encoding
 
@@ -678,9 +694,7 @@ class Storage(object):
                 # consistent state (Otherwise it happens that next time we
                 # call cat_file we get payload from previous call)
                 self.logger.debug("closing cat_file pipe")
-                self.__cat_file_pipe.stdin.close()
-                terminate(self.__cat_file_pipe)
-                self.__cat_file_pipe.wait()
+                self._cleanup_proc(self.__cat_file_pipe)
                 self.__cat_file_pipe = None
 
     def verifyrev(self, rev):
@@ -697,21 +711,24 @@ class Storage(object):
             if fullrev:
                 return fullrev
 
+        refs = _rev_cache.refs_dict
+        if rev == 'HEAD':  # resolve HEAD
+            refname = refs.get('HEAD')
+            if refname in refs:
+                return refs[refname]
+        resolved = refs.get('refs/heads/' + rev)  # resolve branch
+        if resolved:
+            return resolved
+        resolved = refs.get('refs/tags/' + rev)  # resolve tag
+        if resolved:
+            return resolved
+
         # fall back to external git calls
         rc = self.repo.rev_parse('--verify', rev).strip()
         if not rc:
             return None
-
         if rc in _rev_cache.rev_dict:
             return rc
-
-        if rc in _rev_cache.tag_set:
-            sha = self.cat_file('tag', rc).split(None, 2)[:2]
-            if sha[0] != 'object':
-                self.logger.debug("unexpected result from 'git-cat-file tag "
-                                  "%s'" % rc)
-                return None
-            return sha[1]
 
         return None
 
@@ -770,9 +787,10 @@ class Storage(object):
 
         return None
 
-    def get_tags(self):
-        return (self._fs_to_unicode(e.strip())
-                for e in self.repo.tag('-l').splitlines())
+    def get_tags(self, rev=None):
+        return sorted(self._fs_to_unicode(name)
+                      for name, rev_ in self.rev_cache.iter_tags()
+                      if rev is None or rev == rev_)
 
     def ls_tree(self, rev, path=''):
         rev = rev and str(rev) or 'HEAD' # paranoia
@@ -807,12 +825,12 @@ class Storage(object):
 
         db = self.get_commits()
         if commit_id not in db:
-            self.logger.info("read_commit failed for '%s' ('%s')" %
-                             (commit_id, commit_id_orig))
+            self.logger.info("read_commit failed for '%s' ('%s')",
+                             commit_id, commit_id_orig)
             raise GitErrorSha
 
         with self.__commit_msg_lock:
-            if self.__commit_msg_cache.has_key(commit_id):
+            if commit_id in self.__commit_msg_cache:
                 # cache hit
                 result = self.__commit_msg_cache[commit_id]
                 return result[0], dict(result[1])
@@ -843,7 +861,7 @@ class Storage(object):
         db = self.get_commits()
 
         try:
-            return list(db[sha][0])
+            return sorted(db[sha][0])
         except KeyError:
             return []
 
@@ -856,15 +874,15 @@ class Storage(object):
         work_list = deque()
         seen = set()
 
-        seen.update(rev_dict[sha][0])
-        work_list.extend(rev_dict[sha][0])
+        _children = rev_dict[sha][0]
+        seen.update(_children)
+        work_list.extend(_children)
 
         while work_list:
             p = work_list.popleft()
             yield p
 
-            _children = set(rev_dict[p][0]) - seen
-
+            _children = rev_dict[p][0] - seen
             seen.update(_children)
             work_list.extend(_children)
 
@@ -882,15 +900,15 @@ class Storage(object):
         return self.get_commits().iterkeys()
 
     def sync(self):
-        rev = self.repo.rev_list('--max-count=1', '--topo-order', '--all') \
-                       .strip()
-        return self.__rev_cache_sync(rev)
+        with self.__rev_cache_lock:
+            return self._refresh_rev_cache(force=True)
 
     @contextmanager
     def get_historian(self, sha, base_path):
         p = []
         change = {}
         next_path = []
+        base_path = self._fs_from_unicode(base_path)
 
         def name_status_gen():
             p[:] = [self.repo.log_pipe('--pretty=format:%n%H',
@@ -904,6 +922,8 @@ class Storage(object):
                     if l == '\n':
                         break
                     _, path = l.rstrip('\n').split('\t', 1)
+                    # git-log without -z option quotes each pathname
+                    path = _unquote(path)
                     while path not in change:
                         change[path] = old_sha
                         if next_path == [path]:
@@ -912,58 +932,56 @@ class Storage(object):
                             path, _ = path.rsplit('/', 1)
                         except ValueError:
                             break
-            f.close()
-            terminate(p[0])
-            p[0].wait()
+            if p:
+                self._cleanup_proc(p[0])
             p[:] = []
             while True:
                 yield None
         gen = name_status_gen()
 
         def historian(path):
+            path = self._fs_from_unicode(path)
             try:
                 return change[path]
             except KeyError:
                 next_path[:] = [path]
                 return gen.next()
-        yield historian
 
-        if p:
-            p[0].stdout.close()
-            terminate(p[0])
-            p[0].wait()
+        try:
+            yield historian
+        finally:
+            if p:
+                self._cleanup_proc(p[0])
 
     def last_change(self, sha, path, historian=None):
         if historian is not None:
             return historian(path)
-        return self.repo.rev_list('--max-count=1',
-                                  sha, '--',
-                                  self._fs_from_unicode(path)).strip() or None
+        tmp = self.history(sha, path, limit=1)
+        return tmp[0] if tmp else None
 
     def history(self, sha, path, limit=None):
         if limit is None:
             limit = -1
 
-        tmp = self.repo.rev_list('--max-count=%d' % limit, str(sha), '--',
-                                 self._fs_from_unicode(path))
-
-        return [ rev.strip() for rev in tmp.splitlines() ]
+        args = ['--max-count=%d' % limit, str(sha)]
+        if path:
+            args.extend(('--', self._fs_from_unicode(path)))
+        tmp = self.repo.rev_list(*args)
+        return [rev.strip() for rev in tmp.splitlines()]
 
     def history_timerange(self, start, stop):
+        # retrieve start <= committer-time < stop,
+        # see CachedRepository.get_changesets()
         return [ rev.strip() for rev in \
-                     self.repo.rev_list('--reverse',
+                     self.repo.rev_list('--date-order',
                                         '--max-age=%d' % start,
-                                        '--min-age=%d' % stop,
+                                        '--min-age=%d' % (stop - 1),
                                         '--all').splitlines() ]
 
     def rev_is_anchestor_of(self, rev1, rev2):
         """return True if rev2 is successor of rev1"""
 
-        rev1 = rev1.strip()
-        rev2 = rev2.strip()
-
         rev_dict = self.get_commits()
-
         return (rev2 in rev_dict and
                 rev2 in self.children_recursive(rev1, rev_dict))
 

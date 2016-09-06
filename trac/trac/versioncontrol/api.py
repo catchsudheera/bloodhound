@@ -17,21 +17,26 @@
 from __future__ import with_statement
 
 import os.path
-import time
 
 from trac.admin import AdminCommandError, IAdminCommandProvider, get_dir_list
 from trac.config import ConfigSection, ListOption, Option
 from trac.core import *
 from trac.resource import IResourceManager, Resource, ResourceNotFound
 from trac.util.concurrency import threading
-from trac.util.text import printout, to_unicode
+from trac.util.datefmt import time_now
+from trac.util.text import printout, to_unicode, exception_to_unicode
 from trac.util.translation import _
 from trac.web.api import IRequestFilter
+from trac.web.chrome import ITemplateProvider
 
 
 def is_default(reponame):
     """Check whether `reponame` is the default repository."""
     return not reponame or reponame in ('(default)', _('(default)'))
+
+
+class InvalidRepository(TracError):
+    """Exception raised when a repository is invalid."""
 
 
 class IRepositoryConnector(Interface):
@@ -226,6 +231,13 @@ class DbRepositoryProvider(Component):
         if is_default(target):
             target = ''
         rm = RepositoryManager(self.env)
+        repositories = rm.get_all_repositories()
+        if target not in repositories:
+            raise TracError(_("Repository \"%(repo)s\" doesn't exist",
+                              repo=target or '(default)'))
+        if 'alias' in repositories[target]:
+            raise TracError(_('Cannot create an alias to the alias "%(repo)s"',
+                              repo=target or '(default)'))
         with self.env.db_transaction as db:
             id = rm.get_repository_id(reponame)
             db.executemany(
@@ -239,6 +251,11 @@ class DbRepositoryProvider(Component):
         if is_default(reponame):
             reponame = ''
         rm = RepositoryManager(self.env)
+        repositories = rm.get_all_repositories()
+        if any(reponame == repos.get('alias')
+               for repos in repositories.itervalues()):
+            raise TracError(_('Cannot remove the repository "%(repos)s" used '
+                              'in aliases', repos=reponame or '(default)'))
         with self.env.db_transaction as db:
             id = rm.get_repository_id(reponame)
             db("DELETE FROM repository WHERE id=%s", (id,))
@@ -250,9 +267,25 @@ class DbRepositoryProvider(Component):
         """Modify attributes of a repository."""
         if is_default(reponame):
             reponame = ''
+        new_reponame = changes.get('name', reponame)
+        if is_default(new_reponame):
+            new_reponame = ''
         rm = RepositoryManager(self.env)
+        if reponame != new_reponame:
+            repositories = rm.get_all_repositories()
+            if any(reponame == repos.get('alias')
+                   for repos in repositories.itervalues()):
+                raise TracError(_('Cannot rename the repository "%(repos)s" '
+                                  'used in aliases',
+                                  repos=reponame or '(default)'))
         with self.env.db_transaction as db:
             id = rm.get_repository_id(reponame)
+            if reponame != new_reponame:
+                if db("""SELECT id FROM repository WHERE name='name' AND
+                         value=%s""", (new_reponame,)):
+                    raise TracError(_('The repository "%(name)s" already '
+                                      'exists.',
+                                      name=new_reponame or '(default)'))
             for (k, v) in changes.iteritems():
                 if k not in self.repository_attrs:
                     continue
@@ -275,7 +308,8 @@ class DbRepositoryProvider(Component):
 class RepositoryManager(Component):
     """Version control system manager."""
 
-    implements(IRequestFilter, IResourceManager, IRepositoryProvider)
+    implements(IRequestFilter, IResourceManager, IRepositoryProvider,
+               ITemplateProvider)
 
     connectors = ExtensionPoint(IRepositoryConnector)
     providers = ExtensionPoint(IRepositoryProvider)
@@ -336,7 +370,7 @@ class RepositoryManager(Component):
         from trac.web.chrome import Chrome, add_warning
         if handler is not Chrome(self.env):
             for reponame in self.repository_sync_per_request:
-                start = time.time()
+                start = time_now()
                 if is_default(reponame):
                     reponame = ''
                 try:
@@ -353,9 +387,24 @@ class RepositoryManager(Component):
                         _("Can't synchronize with repository \"%(name)s\" "
                           "(%(error)s). Look in the Trac log for more "
                           "information.", name=reponame or '(default)',
-                          error=to_unicode(e.message)))
+                          error=to_unicode(e)))
+                except Exception, e:
+                    add_warning(req,
+                        _("Failed to sync with repository \"%(name)s\": "
+                          "%(error)s; repository information may be out of "
+                          "date. Look in the Trac log for more information "
+                          "including mitigation strategies.",
+                          name=reponame or '(default)', error=to_unicode(e)))
+                    self.log.error(
+                        "Failed to sync with repository \"%s\"; You may be "
+                        "able to reduce the impact of this issue by "
+                        "configuring [trac] repository_sync_per_request; see "
+                        "http://trac.edgewall.org/wiki/TracRepositoryAdmin"
+                        "#ExplicitSync for more detail: %s",
+                        reponame or '(default)',
+                        exception_to_unicode(e, traceback=True))
                 self.log.info("Synchronized '%s' repository in %0.2f seconds",
-                              reponame or '(default)', time.time() - start)
+                              reponame or '(default)', time_now() - start)
         return handler
 
     def post_process_request(self, req, template, data, content_type):
@@ -400,6 +449,8 @@ class RepositoryManager(Component):
             return _('%(kind)s %(id)s%(at_version)s%(in_repo)s',
                      kind=kind, id=id, at_version=version, in_repo=in_repo)
         elif resource.realm == 'repository':
+            if not resource.id:
+                return _("Default repository")
             return _("Repository %(repo)s", repo=resource.id)
 
     def get_resource_url(self, resource, href, **kwargs):
@@ -451,7 +502,7 @@ class RepositoryManager(Component):
             reponames[''] = {'dir': self.repository_dir}
         # first pass to gather the <name>.dir entries
         for option in repositories:
-            if option.endswith('.dir'):
+            if option.endswith('.dir') and repositories.get(option):
                 reponames[option[:-4]] = {}
         # second pass to gather aliases
         for option in repositories:
@@ -469,6 +520,15 @@ class RepositoryManager(Component):
 
         for reponame, info in reponames.iteritems():
             yield (reponame, info)
+
+    # ITemplateProvider methods
+
+    def get_htdocs_dirs(self):
+        return []
+
+    def get_templates_dirs(self):
+        from pkg_resources import resource_filename
+        return [resource_filename('trac.versioncontrol', 'templates')]
 
     # Public API methods
 
@@ -502,8 +562,8 @@ class RepositoryManager(Component):
 
         This will create and save a new id if none is found.
 
-        \note: this should probably be renamed as we're dealing
-               exclusively with *db* repository ids here.
+        Note: this should probably be renamed as we're dealing
+              exclusively with *db* repository ids here.
         """
         with self.env.db_transaction as db:
             for id, in db(
@@ -520,11 +580,13 @@ class RepositoryManager(Component):
         """Retrieve the appropriate `Repository` for the given
         repository name.
 
-           :param reponame: the key for specifying the repository.
-                            If no name is given, take the default
-                            repository.
-           :return: if no corresponding repository was defined,
-                    simply return `None`.
+        :param reponame: the key for specifying the repository.
+                         If no name is given, take the default
+                         repository.
+        :return: if no corresponding repository was defined,
+                 simply return `None`.
+
+        :raises InvalidRepository: if the repository cannot be opened.
         """
         reponame = reponame or ''
         repoinfo = self.get_all_repositories().get(reponame, {})
@@ -584,7 +646,8 @@ class RepositoryManager(Component):
         hierarchy and return the name of its associated repository.
         """
         while context:
-            if context.resource.realm in ('source', 'changeset'):
+            if context.resource.realm in ('source', 'changeset') and \
+                    context.resource.parent:
                 return context.resource.parent.id
             context = context.parent
 
@@ -631,8 +694,8 @@ class RepositoryManager(Component):
         The supported events are the names of the methods defined in the
         `IRepositoryChangeListener` interface.
         """
-        self.log.debug("Event %s on %s for changesets %r",
-                       event, reponame, revs)
+        self.log.debug("Event %s on repository '%s' for changesets %r",
+                       event, reponame or '(default)', revs)
 
         # Notify a repository by name, and all repositories with the same
         # base, or all repositories by base or by repository dir
@@ -653,25 +716,49 @@ class RepositoryManager(Component):
         if not repositories:
             self.log.warn("Found no repositories matching '%s' base.",
                           base or reponame)
-            return
+            return [_("Repository '%(repo)s' not found",
+                      repo=reponame or _("(default)"))]
+
+        errors = []
         for repos in sorted(repositories, key=lambda r: r.reponame):
+            reponame = repos.reponame or '(default)'
+            if reponame in self.repository_sync_per_request:
+                self.log.warn("Repository '%s' should be removed from [trac] "
+                              "repository_sync_per_request for explicit "
+                              "synchronization", reponame)
             repos.sync()
             for rev in revs:
                 args = []
                 if event == 'changeset_modified':
-                    args.append(repos.sync_changeset(rev))
+                    try:
+                        old_changeset = repos.sync_changeset(rev)
+                    except NoSuchChangeset, e:
+                        errors.append(exception_to_unicode(e))
+                        self.log.warn(
+                            "No changeset '%s' found in repository '%s'. "
+                            "Skipping subscribers for event %s",
+                            rev, reponame, event)
+                        continue
+                    else:
+                        args.append(old_changeset)
                 try:
                     changeset = repos.get_changeset(rev)
                 except NoSuchChangeset:
                     try:
                         repos.sync_changeset(rev)
                         changeset = repos.get_changeset(rev)
-                    except NoSuchChangeset:
+                    except NoSuchChangeset, e:
+                        errors.append(exception_to_unicode(e))
+                        self.log.warn(
+                            "No changeset '%s' found in repository '%s'. "
+                            "Skipping subscribers for event %s",
+                            rev, reponame, event)
                         continue
-                self.log.debug("Event %s on %s for revision %s",
-                               event, repos.reponame or '(default)', rev)
+                self.log.debug("Event %s on repository '%s' for revision '%s'",
+                               event, reponame, rev)
                 for listener in self.change_listeners:
                     getattr(listener, event)(repos, changeset, *args)
+        return errors
 
     def shutdown(self, tid=None):
         """Free `Repository` instances bound to a given thread identifier"""
@@ -752,6 +839,8 @@ class Repository(object):
                           the surrogate key that identifies the repository in
                           the database under the key "id".
            :param log: a logger instance.
+
+           :raises InvalidRepository: if the repository cannot be opened.
         """
         self.name = name
         self.params = params
@@ -929,11 +1018,16 @@ class Repository(object):
 
         In addition, if `rev` is `None` or '', the youngest revision should
         be returned.
+
+        :raise NoSuchChangeset: If the given `rev` isn't found.
         """
         raise NotImplementedError
 
     def short_rev(self, rev):
-        """Return a compact representation of a revision in the repos."""
+        """Return a compact representation of a revision in the repos.
+
+        :raise NoSuchChangeset: If the given `rev` isn't found.
+        """
         return self.normalize_rev(rev)
 
     def display_rev(self, rev):
@@ -942,6 +1036,8 @@ class Repository(object):
 
         This can be a shortened revision string, e.g. for repositories using
         long hashes.
+
+        :raise NoSuchChangeset: If the given `rev` isn't found.
         """
         return self.normalize_rev(rev)
 
@@ -997,6 +1093,23 @@ class Node(object):
         The returned object must support a `read([len])` method.
         """
         raise NotImplementedError
+
+    def get_processed_content(self, keyword_substitution=True, eol_hint=None):
+        """Return a stream for reading the content of the node, with some
+        standard processing applied.
+
+        :param keyword_substitution: if `True`, meta-data keywords
+            present in the content like ``$Rev$`` are substituted
+            (which keyword are substituted and how they are
+            substituted is backend specific)
+
+        :param eol_hint: which style of line ending is expected if
+            `None` was explicitly specified for the file itself in
+            the version control backend (for example in Subversion,
+            if it was set to ``'native'``).  It can be `None`,
+            ``'LF'``, ``'CR'`` or ``'CRLF'``.
+        """
+        return self.get_content()
 
     def get_entries(self):
         """Generator that yields the immediate child entries of a directory.

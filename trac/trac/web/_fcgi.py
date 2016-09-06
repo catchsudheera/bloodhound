@@ -1150,7 +1150,7 @@ class WSGIServer(Server):
 
         Set multithreaded to False if your application is not MT-safe.
         """
-        if kw.has_key('handler'):
+        if 'handler' in kw:
             del kw['handler'] # Doesn't make sense to let this through
         super(WSGIServer, self).__init__(**kw)
 
@@ -1191,7 +1191,9 @@ class WSGIServer(Server):
         environ['wsgi.multiprocess'] = True
         environ['wsgi.run_once'] = isinstance(req, CGIRequest)
 
-        if environ.get('HTTPS', 'off') in ('on', '1'):
+        if environ.get('HTTPS', '').lower() in ('yes', 'on', '1'):
+            environ['wsgi.url_scheme'] = 'https'
+        elif environ.get('HTTP_X_FORWARDED_PROTO', '').lower() == 'https':
             environ['wsgi.url_scheme'] = 'https'
         else:
             environ['wsgi.url_scheme'] = 'http'
@@ -1278,9 +1280,9 @@ class WSGIServer(Server):
 
     def _sanitizeEnv(self, environ):
         """Ensure certain values are present, if required by WSGI."""
-        if not environ.has_key('SCRIPT_NAME'):
+        if 'SCRIPT_NAME' not in environ:
             environ['SCRIPT_NAME'] = ''
-        if not environ.has_key('PATH_INFO'):
+        if 'PATH_INFO' not in environ:
             environ['PATH_INFO'] = ''
 
         # If any of these are missing, it probably signifies a broken
@@ -1289,7 +1291,7 @@ class WSGIServer(Server):
                              ('SERVER_NAME', 'localhost'),
                              ('SERVER_PORT', '80'),
                              ('SERVER_PROTOCOL', 'HTTP/1.0')]:
-            if not environ.has_key(name):
+            if name not in environ:
                 environ['wsgi.errors'].write('%s: missing FastCGI param %s '
                                              'required by WSGI!\n' %
                                              (self.__class__.__name__, name))

@@ -1,31 +1,32 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2005-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
+
+from datetime import datetime, timedelta
+
 from trac.perm import PermissionCache, PermissionSystem
-from trac.ticket.api import TicketSystem, ITicketFieldProvider
-from trac.ticket.model import Ticket
+from trac.resource import Resource
 from trac.test import EnvironmentStub, Mock
-from trac.core import implements, Component
+from trac.ticket.api import TicketSystem
+from trac.ticket.model import Milestone, Ticket, Version
+from trac.util.datefmt import datetime_now, utc
 
 import unittest
-
-class TestFieldProvider(Component):
-    implements(ITicketFieldProvider)
-
-    def __init__(self):
-        self.raw_fields = []
-
-    def get_select_fields(self):
-        return []
-
-    def get_radio_fields(self):
-        return []
-
-    def get_raw_fields(self):
-        return self.raw_fields
 
 
 class TicketSystemTestCase(unittest.TestCase):
 
     def setUp(self):
-        self.env = EnvironmentStub()
+        self.env = EnvironmentStub(default_data=True)
         self.perm = PermissionSystem(self.env)
         self.ticket_system = TicketSystem(self.env)
         self.req = Mock()
@@ -39,6 +40,10 @@ class TicketSystemTestCase(unittest.TestCase):
         ticket.populate(ticket_dict)
         id = ticket.insert()
         return ts.get_available_actions(self.req, Ticket(self.env, id))
+
+    def _get_ticket_field(self, field_name):
+        fields = TicketSystem(self.env).get_ticket_fields()
+        return (i for i in fields if i['name'] == field_name).next()
 
     def test_custom_field_text(self):
         self.env.config.set('ticket-custom', 'test', 'text')
@@ -137,44 +142,126 @@ class TicketSystemTestCase(unittest.TestCase):
         self.assertEqual(['leave'], self._get_actions({'status': 'reopened'}))
         self.assertEqual(['leave'], self._get_actions({'status': 'closed'}))
 
-    def test_can_add_raw_fields_from_field_providers(self):
-        testFieldProvider = self.env[TestFieldProvider]
-        self.assertIsNotNone(testFieldProvider)
-        testFieldProvider.raw_fields = [
-            {
-                'name': "test_name",
-                'type': 'some_type',
-                'label': "some_label",
-            },
-        ]
-        fields = TicketSystem(self.env).get_ticket_fields()
-        row_added_fields = [
-            field for field in fields if field["name"] == "test_name"]
-        self.assertEqual(1, len(row_added_fields))
+    def test_get_ticket_fields_version_rename(self):
+        """Cached ticket fields are updated when version is renamed."""
+        fields = self.ticket_system.get_ticket_fields()
+        version_field = self._get_ticket_field('version')
+        v2 = Version(self.env, '2.0')
+        v2.name = '0.0'
 
-    def test_does_not_add_duplicated_raw_fields_from_field_providers(self):
-        testFieldProvider = self.env[TestFieldProvider]
-        self.assertIsNotNone(testFieldProvider)
-        testFieldProvider.raw_fields = [
-            {
-                'name': "test_name",
-                'type': 'some_type1',
-                'label': "some_label1",
-            },
-            {
-                'name': "test_name",
-                'type': 'some_type2',
-                'label': "some_label2",
-            },
-        ]
-        fields = TicketSystem(self.env).get_ticket_fields()
-        row_added_fields = [
-            field for field in fields if field["name"] == "test_name"]
-        self.assertEqual(1, len(row_added_fields))
+        v2.update()
+        updated_fields = self.ticket_system.get_ticket_fields()
+        updated_version_field = self._get_ticket_field('version')
+
+        self.assertNotEqual(fields, updated_fields)
+        self.assertEqual(['2.0', '1.0'], version_field['options'])
+        self.assertEqual(['1.0', '0.0'], updated_version_field['options'])
+
+    def test_get_ticket_fields_version_update_time(self):
+        """Cached ticket fields are updated when version release time
+        is changed.
+        """
+        fields = self.ticket_system.get_ticket_fields()
+        version_field = self._get_ticket_field('version')
+        v1 = Version(self.env, '1.0')
+        v1.time = datetime_now(utc)
+        v2 = Version(self.env, '2.0')
+        v2.time = v1.time - timedelta(seconds=1)
+
+        v1.update()
+        v2.update()
+        updated_fields = self.ticket_system.get_ticket_fields()
+        updated_version_field = self._get_ticket_field('version')
+
+        self.assertNotEqual(fields, updated_fields)
+        self.assertEqual(['2.0', '1.0'], version_field['options'])
+        self.assertEqual(['1.0', '2.0'], updated_version_field['options'])
+
+    def test_get_ticket_fields_milestone_rename(self):
+        """Cached ticket fields are updated when milestone is renamed."""
+        fields = self.ticket_system.get_ticket_fields()
+        milestone_field = self._get_ticket_field('milestone')
+        m2 = Milestone(self.env, 'milestone2')
+        m2.name = 'milestone5'
+
+        m2.update()
+        updated_fields = self.ticket_system.get_ticket_fields()
+        updated_milestone_field = self._get_ticket_field('milestone')
+
+        self.assertNotEqual(fields, updated_fields)
+        self.assertEqual(['milestone1', 'milestone2',
+                          'milestone3', 'milestone4'],
+                         milestone_field['options'])
+        self.assertEqual(['milestone1', 'milestone3',
+                          'milestone4', 'milestone5'],
+                         updated_milestone_field['options'])
+
+    def test_get_ticket_fields_milestone_update_completed(self):
+        """Cached ticket fields are updated when milestone is completed
+        date is changed.
+        """
+        fields = self.ticket_system.get_ticket_fields()
+        milestone_field = self._get_ticket_field('milestone')
+        m2 = Milestone(self.env, 'milestone2')
+        m2.completed = datetime_now(utc)
+
+        m2.update()
+        updated_fields = self.ticket_system.get_ticket_fields()
+        updated_milestone_field = self._get_ticket_field('milestone')
+
+        self.assertNotEqual(fields, updated_fields)
+        self.assertEqual(['milestone1', 'milestone2',
+                          'milestone3', 'milestone4'],
+                         milestone_field['options'])
+        self.assertEqual(['milestone2', 'milestone1',
+                          'milestone3', 'milestone4'],
+                         updated_milestone_field['options'])
+
+    def test_get_ticket_fields_milestone_update_due(self):
+        """Cached ticket fields are updated when milestone due date is
+        changed.
+        """
+        fields = self.ticket_system.get_ticket_fields()
+        milestone_field = self._get_ticket_field('milestone')
+        m2 = Milestone(self.env, 'milestone2')
+        m2.due = datetime_now(utc)
+
+        m2.update()
+        updated_fields = self.ticket_system.get_ticket_fields()
+        updated_milestone_field = self._get_ticket_field('milestone')
+
+        self.assertNotEqual(fields, updated_fields)
+        self.assertEqual(['milestone1', 'milestone2',
+                          'milestone3', 'milestone4'],
+                         milestone_field['options'])
+        self.assertEqual(['milestone2', 'milestone1',
+                          'milestone3', 'milestone4'],
+                         updated_milestone_field['options'])
+
+    def test_resource_exists_valid_resource_id(self):
+        Ticket(self.env).insert()
+        r1 = Resource('ticket', 1)
+        r2 = Resource('ticket', 2)
+
+        self.assertTrue(self.ticket_system.resource_exists(r1))
+        self.assertFalse(self.ticket_system.resource_exists(r2))
+
+    def test_resource_exists_invalid_resource_id(self):
+        """Exception is trapped from resource with invalid id."""
+        r1 = Resource('ticket', None)
+        r2 = Resource('ticket', 'abc')
+        r3 = Resource('ticket', '2.')
+        r4 = Resource('ticket', r2)
+
+        self.assertFalse(self.ticket_system.resource_exists(r1))
+        self.assertFalse(self.ticket_system.resource_exists(r2))
+        self.assertFalse(self.ticket_system.resource_exists(r3))
+        self.assertFalse(self.ticket_system.resource_exists(r4))
 
 
 def suite():
-    return unittest.makeSuite(TicketSystemTestCase, 'test')
+    return unittest.makeSuite(TicketSystemTestCase)
+
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(defaultTest='suite')

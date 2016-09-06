@@ -316,6 +316,13 @@ nolink:"<blink>"
 nolink:&#34;&lt;blink&gt;&#34;
 </p>
 ------------------------------
+============================== Bracketed links
+See <http://en.wikipedia.org/wiki/Mornington_Crescent_(game)>
+------------------------------
+<p>
+See &lt;<a class="ext-link" href="http://en.wikipedia.org/wiki/Mornington_Crescent_(game)"><span class="icon"></span>http://en.wikipedia.org/wiki/Mornington_Crescent_(game)</a>&gt;
+</p>
+------------------------------
 ============================================================
 
         Other Links
@@ -356,6 +363,7 @@ Relative links are supported:
 [[../parent|See above]] Note: see wikisyntax tests for other parent tests
 [[./sibling|See next]]
 [[...|nothing to see]] [[...]]
+[[//a ] ]]
 [[//docs|See documentation]]
 [[//images/logo.png|Our logo]]
 [[/]]
@@ -369,6 +377,7 @@ Relative links are supported:
 <a class="missing wiki" href="/wiki/parent" rel="nofollow">See above?</a> Note: see wikisyntax tests for other parent tests
 <a class="missing wiki" href="/wiki/WikiStart/sibling" rel="nofollow">See next?</a>
 <a class="missing wiki" href="/wiki/..." rel="nofollow">nothing to see?</a> <a class="missing wiki" href="/wiki/..." rel="nofollow">...?</a>
+<a class="missing wiki" href="/wiki/a%20%5D%20" rel="nofollow">a ] ?</a>
 <a href="/docs">See documentation</a>
 <a href="/images/logo.png">Our logo</a>
 <a href="/">/</a>
@@ -474,9 +483,9 @@ th:'wiki:"my test spaced wiki3"'
 ============================== Another arbitrary protocol Link
 svn+ssh://secureserver.org
 [svn+ssh://secureserver.org SVN link]
-[rfc-2396.compatible://link]
+rfc-2396.compatible://link
 [rfc-2396.compatible://link RFC 2396]
-[rfc-2396+under_score://link]
+rfc-2396+under_score://link
 [rfc-2396+under_score://link underscore]
 unsafe://scheme is not rendered
 ------------------------------
@@ -488,15 +497,6 @@ unsafe://scheme is not rendered
 <a class="ext-link" href="rfc-2396+under_score://link"><span class="icon"></span>rfc-2396+under_score://link</a>
 <a class="ext-link" href="rfc-2396+under_score://link"><span class="icon"></span>underscore</a>
 unsafe://scheme is not rendered
-</p>
-------------------------------
-============================== Another arbitrary protocol Link without [] - SKIP as it clashes with Jira ticket syntax
-rfc-2396.compatible://link
-rfc-2396+under_score://link
-------------------------------
-<p>
-<a class="ext-link" href="rfc-2396.compatible://link"><span class="icon"></span>rfc-2396.compatible://link</a>
-<a class="ext-link" href="rfc-2396+under_score://link"><span class="icon"></span>rfc-2396+under_score://link</a>
 </p>
 ------------------------------
 ============================== WikiCreole style for the above examples
@@ -1177,6 +1177,35 @@ Inline  comment
 </p>
 ------------------------------
 Inline  comment
+============================== Exception with ascii bytes
+[[ValueErrorWithUtf8(error)]]
+------------------------------
+<p>
+<div class="system-message"><strong>Error: Macro ValueErrorWithUtf8(error) failed</strong><pre>error</pre></div>
+</p>
+------------------------------
+============================== Exception with utf-8 bytes
+{{{#!ValueErrorWithUtf8
+Érrör
+}}}
+[[ValueErrorWithUtf8(érrör)]]
+------------------------------
+<div class="system-message"><strong>Error: Processor ValueErrorWithUtf8 failed</strong><pre>Érrör
+</pre></div><p>
+<div class="system-message"><strong>Error: Macro ValueErrorWithUtf8(érrör) failed</strong><pre>érrör</pre></div>
+</p>
+------------------------------
+============================== TracError with unicode
+{{{#!TracErrorWithUnicode
+Érrör
+}}}
+[[TracErrorWithUnicode(érrör)]]
+------------------------------
+<div class="system-message"><strong>Error: Processor TracErrorWithUnicode failed</strong><pre>Érrör
+</pre></div><p>
+<div class="system-message"><strong>Error: Macro TracErrorWithUnicode(érrör) failed</strong><pre>érrör</pre></div>
+</p>
+------------------------------
 ============================================================
 
            Headings
@@ -1419,36 +1448,48 @@ Paragraph
  1. item 1
    a. item 1.a
    a. item 1.b
+     0. start at 0
 
 Some paragraph
 
  2. continue with item 2
     i. roman 1
     ii. roman 2
+      II. upper roman
+          B. upper alpha
+          C. etc.
 Paragraph
 ------------------------------
 <ol><li>item 1
 <ol class="loweralpha"><li>item 1.a
 </li><li>item 1.b
-</li></ol></li></ol><p>
+<ol start="0"><li>start at 0
+</li></ol></li></ol></li></ol><p>
 Some paragraph
 </p>
 <ol start="2"><li>continue with item 2
 <ol class="lowerroman"><li>roman 1
 </li><li>roman 2
-</li></ol></li></ol><p>
+<ol class="upperroman"><li>upper roman
+<ol class="upperalpha" start="2"><li>upper alpha
+</li><li>etc.
+</li></ol></li></ol></li></ol></li></ol><p>
 Paragraph
 </p>
 ------------------------------
 1. item 1
    a. item 1.a
    a. item 1.b
+     0. start at 0
 
 Some paragraph
 
  2. continue with item 2
     i. roman 1
     ii. roman 2
+      II. upper roman
+          B. upper alpha
+          C. etc.
 Paragraph
 ============================== Numbered lists multi-line items
  1. This is a very long line at
@@ -2573,3 +2614,114 @@ c
 ------------------------------
  […]
 &gt; c
+============================== List immediately followed by binary inline markup, #11009
+***
+* list
+***
+------------------------------
+<p>
+<strong>*
+</strong></p>
+<ul><li>list
+</li></ul><p>
+<strong>*
+</strong></p>
+------------------------------
+============================== List immediately followed by binary inline markup 1, #11373
+ 1. normal in list
+''italic
+in paragraph
+
+ 1. normal in list
+//italic
+in paragraph
+------------------------------
+<ol><li>normal in list
+</li></ol><p>
+<em>italic
+in paragraph
+</em></p>
+<ol><li>normal in list
+</li></ol><p>
+<em>italic
+in paragraph
+</em></p>
+------------------------------
+============================== List immediately followed by binary inline markup 2, #11373
+ 1. //italic in list
+''italic
+in paragraph
+
+ 1. ''italic in list
+//italic
+in paragraph
+
+1. ''italic in list
+''italic
+in paragraph
+
+1. //italic in list
+//italic
+in paragraph
+------------------------------
+<ol><li><em>italic in list
+</em></li></ol><p>
+<em>italic
+in paragraph
+</em></p>
+<ol><li><em>italic in list
+</em></li></ol><p>
+<em>italic
+in paragraph
+</em></p>
+<ol><li><em>italic in list
+</em></li></ol><p>
+<em>italic
+in paragraph
+</em></p>
+<ol><li><em>italic in list
+</em></li></ol><p>
+<em>italic
+in paragraph
+</em></p>
+------------------------------
+============================== List immediately followed by binary inline markup 3, #11373
+ 1. ''italic in list
+'''''bolditalic
+in paragraph'''''
+------------------------------
+<ol><li><em>italic in list
+</em></li></ol><p>
+<strong><em>bolditalic
+in paragraph</em></strong>
+</p>
+------------------------------
+============================== List immediately followed by binary inline markup 4, #11373
+ 1. '''bold in list
+'''''bolditalic
+in paragraph'''''
+------------------------------
+<ol><li><strong>bold in list
+</strong></li></ol><p>
+<strong><em>bolditalic
+in paragraph</em></strong>
+</p>
+------------------------------
+============================== Processor with attributes using hyphens (#12023)
+Begin.
+{{{
+#!div class=wiki accept-charset=utf-8
+A paragraph in div element.
+}}}
+End.
+------------------------------
+<p>
+Begin.
+</p>
+<div accept-charset="utf-8" class="wiki"><p>
+A paragraph in div element.
+</p>
+</div><p>
+End.
+</p>
+------------------------------

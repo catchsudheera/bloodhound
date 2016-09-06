@@ -59,9 +59,43 @@
     });
   }
 
+  // Disable the form's submit action after the submit button is pressed by
+  // replacing it with a handler that cancels the action. The handler is
+  // removed when navigating away from the page so that the action will
+  // be enabled when using the back button to return to the page.
+  $.fn.disableOnSubmit = function() {
+    this.click(function() {
+      var form = $(this).closest("form");
+      if (form.hasClass("trac-submit-is-disabled")) {
+        form.bind("submit.prevent-submit", function() {
+          return false;
+        });
+        $(window).on("unload", function() {
+          form.unbind("submit.prevent-submit");
+        });
+      } else {
+        form.addClass("trac-submit-is-disabled");
+        $(window).on("unload", function() {
+          form.removeClass("trac-submit-is-disabled");
+        })
+      }
+    });
+  }
+
   $.loadStyleSheet = function(href, type) {
     type = type || "text/css";
     $(document).ready(function() {
+      var link;
+      $("link[rel=stylesheet]").each(function() {
+        if (this.getAttribute("href") === href) {
+          if (this.disabled)
+            this.disabled = false;
+          link = this;
+          return false;
+        }
+      });
+      if (link !== undefined)
+        return;
       if (document.createStyleSheet) { // MSIE
         document.createStyleSheet(href);
       } else {
@@ -69,7 +103,51 @@
           .appendTo("head");
       }
     });
-  }
+  };
+
+  // {script.src: [listener1, listener2, ...]}
+  var readyListeners = {};
+
+  $.documentReady = function(listener) {
+    var script = document.currentScript;
+    if (script === undefined) {
+      script = $("head script");
+      script = script[script.length - 1];
+    }
+    if (script) {
+      var href = script.getAttribute("src");
+      if (!(href in readyListeners))
+        readyListeners[href] = [];
+      var listeners = readyListeners[href];
+      listeners.push(listener);
+    }
+    $(document).ready(listener);
+  };
+
+  $.loadScript = function(href, type, charset) {
+    var script;
+    $("head script").each(function() {
+      if (this.getAttribute("src") === href) {
+        script = this;
+        return false;
+      }
+    });
+    if (script !== undefined) {
+      // Call registered ready listeners
+      $.each(readyListeners[href] || [], function(idx, listener) {
+        listener.call(document, $);
+      });
+    } else {
+      // Don't use $("<script>").appendTo("head") to avoid adding
+      // "_=<timestamp>" parameter to url.
+      script = document.createElement("script");
+      script.src = href;
+      script.async = false;
+      script.type = type || "text/javascript";
+      script.charset = charset || "utf-8";
+      $("head")[0].appendChild(script);
+    }
+  };
 
   // Escape special HTML characters (&<>")
   var quote = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"};

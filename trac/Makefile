@@ -42,7 +42,7 @@ define HELP
 
  ---------------- Standalone test server
 
-  server              start tracd
+  [start-]server      start tracd
 
   [port=...]          variable for selecting the port
   [auth=...]          variable for specifying authentication
@@ -95,10 +95,17 @@ define HELP
   [epydocopts=...]    variable containing extra options for Epydoc
   [dotpath=/.../dot]  path to Graphviz dot program (not used yet)
 
+ ---------------- Miscellaneous
+
+  start-admin         start trac-admin (on `env')
+  start-python        start the Python interpreter
+
+  [adminopts=...]     variable containing extra options for trac-admin
+
 endef
 export HELP
 
-# ` (keep emacs font-lock happy)
+# ' (keep emacs font-lock happy)
 
 define HELP_CFG
  It looks like you don't have a Makefile.cfg file yet.
@@ -117,9 +124,12 @@ export HELP_CFG
 
 .PHONY: all help status clean clean-bytecode clean-mo
 
+%.py : status
+	python setup.py -q test -s $(subst /,.,$(@:.py=)).suite $(testopts)
+
 ifdef test
 all: status
-	python $(test) $(testopts)
+	python setup.py -q test -s $(subst /,.,$(test:.py=)).suite $(testopts)
 else
 all: help
 endif
@@ -132,15 +142,24 @@ Makefile.cfg:
 	@echo "$$HELP_CFG"
 
 status:
-	@echo -n "Python version: "
-	@python -V
-	@echo -n "figleaf: "
-	@-which figleaf 2>/dev/null || echo
-	@echo -n "coverage: "
-	@-which coverage 2>/dev/null || echo
-	@echo "PYTHONPATH=$$PYTHONPATH"
-	@echo "TRAC_TEST_DB_URI=$$TRAC_TEST_DB_URI"
-	@echo "server-options=$(server-options)"
+	@echo
+	@printf "Python: "
+	@which python
+	@echo
+	@python contrib/make_status.py
+	@echo
+	@echo "Variables:"
+	@echo "  PATH=$$PATH"
+	@echo "  PYTHONPATH=$$PYTHONPATH"
+	@echo "  TRAC_TEST_DB_URI=$$TRAC_TEST_DB_URI"
+	@echo "  server-options=$(server-options)"
+	@echo
+	@echo "External dependencies:"
+	@printf "  Git version: "
+	@git --version 2>/dev/null || echo "not installed"
+	@printf "  Subversion version: "
+	@svn --version -q 2>/dev/null || echo "not installed"
+	@echo
 
 Trac.egg-info: status
 	python setup.py egg_info
@@ -148,11 +167,16 @@ Trac.egg-info: status
 clean: clean-bytecode clean-figleaf clean-coverage clean-doc
 
 clean-bytecode:
-	find -name \*.py[co] -exec rm {} \;
+	find . -name \*.py[co] -exec rm {} \;
 
 Makefile: ;
 
 # ----------------------------------------------------------------------------
+#
+# Copy Makefile.cfg.sample to Makefile.cfg and adapt to your local
+# environment, no customizations to the present Makefile should be
+# necessary.
+#
 #
 -include Makefile.cfg
 #
@@ -220,7 +244,7 @@ compile: $(addprefix compile-,$(locale))
 else
 compile:
 	python setup.py $(foreach catalog,$(catalogs), \
-	    compile_catalog$(_catalog))
+	    compile_catalog$(_catalog)) generate_messages_js
 endif
 
 
@@ -231,7 +255,7 @@ pre-check:
 	@echo "checking catalogs for $(locales)..."
 
 check-%:
-	@echo -n "$(@): "
+	@printf "$(@): "
 	python setup.py $(foreach catalog,$(catalogs), \
 	    check_catalog$(_catalog) -l $(*))
 	@$(foreach catalog,$(catalogs), \
@@ -247,14 +271,14 @@ pre-stats: stats-pot
 stats-pot:
 	@echo "translation statistics for catalog templates:"
 	@$(foreach catalog,$(catalogs), \
-	    echo -n "$(catalog.pot): "; \
+	    printf "$(catalog.pot): "; \
 	    msgfmt --statistics $(catalog.pot);)
 	@rm -f messages.mo
 
 stats-%:
 	@$(foreach catalog,$(catalogs), \
 	    [ -e $(catalog.po) ] \
-	    && { echo -n "$(catalog.po): "; \
+	    && { printf "$(catalog.po): "; \
 	         msgfmt --statistics $(catalog.po); } \
 	    || echo "$(catalog.po) doesn't exist (make init-$(*))";)
 	@rm -f messages.mo
@@ -295,7 +319,7 @@ diff-%:
 	@diff=l10n-$(*).diff; \
 	$(vc) diff trac/locale/$(*) > $$diff; \
 	[ -s $$diff ] && { \
-	    echo -n "# $(*) changed -> "; \
+	    printf "# $(*) changed -> "; \
 	    python contrib/l10n_diff_index.py $$diff; \
 	} || rm $$diff
 
@@ -325,7 +349,7 @@ unit-test: Trac.egg-info
 	python ./trac/test.py --skip-functional-tests $(testopts)
 
 functional-test: Trac.egg-info
-	python trac/tests/functional/__init__.py -v $(testopts)
+	python trac/tests/functional/__init__.py $(testopts)
 
 test-wiki:
 	python trac/tests/allwiki.py $(testopts)
@@ -356,6 +380,8 @@ pylint:
 #
 # ----------------------------------------------------------------------------
 
+COVERAGEOPTS ?= --branch --source=trac,tracopt
+
 .PHONY: coverage clean-coverage show-coverage
 
 coverage: clean-coverage test-coverage show-coverage
@@ -372,18 +398,18 @@ test-coverage: unit-test-coverage functional-test-coverage
 endif
 
 unit-test-coverage:
-	coverage run -a $(coverageopts) trac/test.py --skip-functional-tests
+	coverage run -a $(coverageopts) $(COVERAGEOPTS) \
+	    trac/test.py --skip-functional-tests $(testopts)
 
 functional-test-coverage:
-	FIGLEAF='coverage run -a $(coverageopts)' python \
-	    trac/tests/functional/testcases.py -v
+	FIGLEAF='coverage run -a $(coverageopts) $(COVERAGEOPTS)' \
+	python trac/tests/functional/__init__.py -v $(testopts)
 
 show-coverage: htmlcov/index.html
-	#coverage report
+	$(if $(START),$(START) $(<))
 
 htmlcov/index.html:
-	coverage html \
-	    --omit=$(subst $(space),$(comma),$(wildcard trac/*/templates)),trac/templates
+	coverage html --omit=*/__init__.py
 
 # ----------------------------------------------------------------------------
 #
@@ -450,14 +476,36 @@ define server-options
  $(if $(wildcard $(env)/VERSION),$(env),-e $(env))
 endef
 
-.PHONY: server
+.PHONY: server start-server tracd start-tracd
 
-server: Trac.egg-info
+server tracd start-tracd: start-server
+
+start-server: Trac.egg-info
 ifdef env
 	python trac/web/standalone.py $(server-options)
 else
 	@echo "\`env' variable was not specified. See \`make help'."
 endif
+
+
+.PHONY: trac-admin start-admin
+
+trac-admin: start-admin
+
+start-admin:
+ifneq "$(wildcard $(env)/VERSION)" ""
+	@python trac/admin/console.py $(env) $(adminopts)
+else
+	@echo "\`env' variable was not specified or doesn't point to one env."
+endif
+
+
+.PHONY: start-python
+
+start-python:
+	@python
+# (this doesn't seem to be much, but we're taking benefit of the
+# environment setup we're doing below)
 
 
 # ----------------------------------------------------------------------------
@@ -509,24 +557,37 @@ clean-doc:
 #
 # Setup environment variables
 
-python-home := $(python.$(if $(python),$(python),$($(db).python)))
+python-home := $(python.$(or $(python),$($(db).python)))
+
+ifeq "$(findstring ;,$(PATH))" ";"
+    SEP = ;
+    START ?= start
+else
+    SEP = :
+    START ?= xdg-open
+endif
 
 ifeq "$(OS)" "Windows_NT"
     ifndef python-home
         # Detect location of current python
         python-exe := $(shell python -c 'import sys; print sys.executable')
         python-home := $(subst \python.exe,,$(python-exe))
+        ifeq "$(SEP)" ":"
+            python-home := /$(subst :,,$(subst \,/,$(python-home)))
+        endif
     endif
-    SEP = ;
     python-bin = $(python-home)$(SEP)$(python-home)/Scripts
-else
-    SEP = :
 endif
 
-ifdef python-bin
-    export PATH := $(python-bin)$(SEP)$(PATH)
-endif
-export PYTHONPATH := .$(SEP)$(PYTHONPATH)
+define prepend-path
+$(if $2,$(if $1,$1$(SEP)$2,$2),$1)
+endef
+
+PATH-extension = $(call prepend-path,$(python-bin),$(path.$(python)))
+PYTHONPATH-extension = $(call prepend-path,.,$(pythonpath.$(python)))
+
+export PATH := $(call prepend-path,$(PATH-extension),$(PATH))
+export PYTHONPATH := $(call prepend-path,$(PYTHONPATH-extension),$(PYTHONPATH))
 export TRAC_TEST_DB_URI = $($(db).uri)
 
 # Misc.

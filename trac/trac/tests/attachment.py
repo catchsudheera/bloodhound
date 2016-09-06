@@ -1,7 +1,19 @@
 # -*- coding: utf-8 -*-
+#
+# Copyright (C) 2005-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
 
-import os.path
-import shutil
+from __future__ import with_statement
+
+import os
 from StringIO import StringIO
 import tempfile
 import unittest
@@ -9,9 +21,9 @@ import unittest
 from trac.attachment import Attachment, AttachmentModule
 from trac.core import Component, implements, TracError
 from trac.perm import IPermissionPolicy, PermissionCache
-from trac.resource import Resource, resource_exists
-from trac.test import EnvironmentStub
-from trac.tests.resource import TestResourceChangeListener
+from trac.resource import IResourceManager, Resource, resource_exists
+from trac.test import EnvironmentStub, MockRequest
+from trac.web.api import HTTPBadRequest
 
 
 hashes = {
@@ -44,8 +56,7 @@ class AttachmentTestCase(unittest.TestCase):
 
     def setUp(self):
         self.env = EnvironmentStub()
-        self.env.path = os.path.join(tempfile.gettempdir(), 'trac-tempenv')
-        os.mkdir(self.env.path)
+        self.env.path = tempfile.mkdtemp(prefix='trac-tempenv-')
         self.attachments_dir = os.path.join(self.env.path, 'files',
                                             'attachments')
         self.env.config.set('trac', 'permission_policies',
@@ -53,10 +64,13 @@ class AttachmentTestCase(unittest.TestCase):
         self.env.config.set('attachment', 'max_size', 512)
 
         self.perm = PermissionCache(self.env)
+        with self.env.db_transaction as db:
+            db("INSERT INTO wiki (name,version) VALUES ('WikiStart',1)")
+            db("INSERT INTO wiki (name,version) VALUES ('SomePage',1)")
+            db("INSERT INTO ticket (id) VALUES (42)")
 
     def tearDown(self):
-        shutil.rmtree(self.env.path)
-        self.env.reset_db()
+        self.env.reset_db_and_disk()
 
     def test_get_path(self):
         attachment = Attachment(self.env, 'ticket', 42)
@@ -144,7 +158,7 @@ class AttachmentTestCase(unittest.TestCase):
                                       hashes['42'][0:3], hashes['42'],
                                       hashes['foo.2.txt'] + '.txt'),
                          attachment.path)
-        self.assert_(os.path.exists(attachment.path))
+        self.assertTrue(os.path.exists(attachment.path))
 
     def test_insert_outside_attachments_dir(self):
         attachment = Attachment(self.env, '../../../../../sth/private', 42)
@@ -163,8 +177,8 @@ class AttachmentTestCase(unittest.TestCase):
         attachment1.delete()
         attachment2.delete()
 
-        assert not os.path.exists(attachment1.path)
-        assert not os.path.exists(attachment2.path)
+        self.assertFalse(os.path.exists(attachment1.path))
+        self.assertFalse(os.path.exists(attachment2.path))
 
         attachments = Attachment.select(self.env, 'wiki', 'SomePage')
         self.assertEqual(0, len(list(attachments)))
@@ -191,7 +205,7 @@ class AttachmentTestCase(unittest.TestCase):
         self.assertEqual(2, len(list(attachments)))
         attachments = Attachment.select(self.env, 'ticket', 123)
         self.assertEqual(0, len(list(attachments)))
-        assert os.path.exists(path1) and os.path.exists(attachment2.path)
+        self.assertTrue(os.path.exists(path1) and os.path.exists(attachment2.path))
 
         attachment1.reparent('ticket', 123)
         self.assertEqual('ticket', attachment1.parent_realm)
@@ -203,19 +217,15 @@ class AttachmentTestCase(unittest.TestCase):
         self.assertEqual(1, len(list(attachments)))
         attachments = Attachment.select(self.env, 'ticket', 123)
         self.assertEqual(1, len(list(attachments)))
-        assert not os.path.exists(path1) and os.path.exists(attachment1.path)
-        assert os.path.exists(attachment2.path)
+        self.assertFalse(os.path.exists(path1) and os.path.exists(attachment1.path))
+        self.assertTrue(os.path.exists(attachment2.path))
 
     def test_legacy_permission_on_parent(self):
         """Ensure that legacy action tests are done on parent.  As
         `ATTACHMENT_VIEW` maps to `TICKET_VIEW`, the `TICKET_VIEW` is tested
         against the ticket's resource."""
         attachment = Attachment(self.env, 'ticket', 42)
-        self.assert_('ATTACHMENT_VIEW' in self.perm(attachment.resource))
-
-    def test_resource_doesnt_exist(self):
-        r = Resource('wiki', 'WikiStart').child('attachment', 'file.txt')
-        self.assertEqual(False, AttachmentModule(self.env).resource_exists(r))
+        self.assertTrue('ATTACHMENT_VIEW' in self.perm(attachment.resource))
 
     def test_resource_exists(self):
         att = Attachment(self.env, 'wiki', 'WikiStart')
@@ -223,63 +233,77 @@ class AttachmentTestCase(unittest.TestCase):
         self.assertTrue(resource_exists(self.env, att.resource))
 
 
-class AttachmentResourceChangeListenerTestCase(unittest.TestCase):
-    DUMMY_PARENT_REALM = "wiki"
-    DUMMY_PARENT_ID = "WikiStart"
+class AttachmentModuleTestCase(unittest.TestCase):
 
     def setUp(self):
-        self.env = EnvironmentStub(default_data=True)
-        self.listener = TestResourceChangeListener(self.env)
-        self.listener.resource_type = Attachment
-        self.listener.callback = self.listener_callback
+        self.env = EnvironmentStub()
+        self.env.path = tempfile.mkdtemp(prefix='trac-tempenv-')
 
     def tearDown(self):
-        self.env.reset_db()
+        self.env.reset_db_and_disk()
 
-    def test_change_listener_created(self):
-        attachment = self._create_attachment()
-        self.assertEqual('created', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, Attachment))
-        self.assertEqual(attachment.filename, self.filename)
-        self.assertEqual(attachment.parent_realm, self.parent_realm)
-        self.assertEqual(attachment.parent_id, self.parent_id)
+    class GenericResourceManager(Component):
 
-    def test_change_listener_reparent(self):
-        attachment = self._create_attachment()
-        attachment.reparent(self.DUMMY_PARENT_REALM, "SomePage")
+        implements(IResourceManager)
 
-        self.assertEqual('changed', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, Attachment))
-        self.assertEqual(attachment.filename, self.filename)
-        self.assertEqual(attachment.parent_realm, self.parent_realm)
-        self.assertEqual("SomePage", self.parent_id)
-        self.assertNotIn("parent_realm", self.listener.old_values)
-        self.assertEqual(
-            self.DUMMY_PARENT_ID, self.listener.old_values["parent_id"])
+        def get_resource_realms(self):
+            yield 'parent_realm'
 
-    def test_change_listener_deleted(self):
-        attachment = self._create_attachment()
-        attachment.delete()
-        self.assertEqual('deleted', self.listener.action)
-        self.assertTrue(isinstance(self.listener.resource, Attachment))
-        self.assertEqual(attachment.filename, self.filename)
+        def get_resource_url(self, resource, href, **kwargs):
+            pass
 
-    def _create_attachment(self):
-        attachment = Attachment(
-            self.env, self.DUMMY_PARENT_REALM, self.DUMMY_PARENT_ID)
-        attachment.insert('file.txt', StringIO(''), 1)
-        return attachment
+        def get_resource_description(self, resource, format='default',
+                                     context=None, **kwargs):
+            pass
 
-    def listener_callback(self, action, resource, context, old_values = None):
-        self.parent_realm = resource.parent_realm
-        self.parent_id = resource.parent_id
-        self.filename = resource.filename
+        def resource_exists(self, resource):
+            return resource.id == 'parent_id'
+
+    def test_invalid_post_request_raises_exception(self):
+
+        path_info = '/attachment/parent_realm/parent_id/attachment_id'
+        attachment = Attachment(self.env, 'parent_realm', 'parent_id')
+        attachment.insert('attachment_id', StringIO(''), 0, 1)
+        req = MockRequest(self.env, method='POST', action=None,
+                          path_info=path_info)
+        module = AttachmentModule(self.env)
+
+        self.assertTrue(module.match_request(req))
+        self.assertRaises(HTTPBadRequest, module.process_request, req)
+
+    def test_post_request_without_attachment_raises_exception(self):
+        """TracError is raised when a POST request is submitted
+        without an attachment.
+        """
+        path_info = '/attachment/parent_realm/parent_id'
+        req = MockRequest(self.env, path_info=path_info, method='POST',
+                          args={'action': 'new'})
+        module = AttachmentModule(self.env)
+
+        self.assertTrue(module.match_request(req))
+        self.assertRaises(TracError, module.process_request, req)
+
+    def test_attachment_parent_realm_raises_exception(self):
+        """TracError is raised when 'attachment' is the resource parent
+        realm.
+        """
+        path_info = '/attachment/attachment/parent_id/attachment_id'
+        req = MockRequest(self.env, path_info=path_info)
+        module = AttachmentModule(self.env)
+
+        self.assertTrue(module.match_request(req))
+        self.assertRaises(TracError, module.process_request, req)
+
+    def test_resource_doesnt_exist(self):
+        """Non-existent resource returns False from resource_exists."""
+        r = Resource('wiki', 'WikiStart').child('attachment', 'file.txt')
+        self.assertFalse(AttachmentModule(self.env).resource_exists(r))
+
 
 def suite():
     suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(AttachmentTestCase, 'test'))
-    suite.addTest(unittest.makeSuite(
-        AttachmentResourceChangeListenerTestCase, 'test'))
+    suite.addTest(unittest.makeSuite(AttachmentTestCase))
+    suite.addTest(unittest.makeSuite(AttachmentModuleTestCase))
     return suite
 
 if __name__ == '__main__':

@@ -24,15 +24,14 @@ from genshi.builder import tag
 from trac.config import ListOption, BoolOption, Option
 from trac.core import *
 from trac.mimeview.api import IHTMLPreviewAnnotator, Mimeview, is_binary
-from trac.perm import IPermissionRequestor
+from trac.perm import IPermissionRequestor, PermissionError
 from trac.resource import Resource, ResourceNotFound
 from trac.util import as_bool, embedded_numbers
-from trac.util.compat import cleandoc
-from trac.util.datefmt import http_date, to_datetime, utc
+from trac.util.datefmt import datetime_now, http_date, to_datetime, utc
 from trac.util.html import escape, Markup
 from trac.util.text import exception_to_unicode, shorten_line
 from trac.util.translation import _, cleandoc_
-from trac.web import IRequestHandler, RequestDone
+from trac.web.api import IRequestHandler, RequestDone
 from trac.web.chrome import (INavigationContributor, add_ctxtnav, add_link,
                              add_script, add_stylesheet, prevnext_nav,
                              web_context)
@@ -296,7 +295,8 @@ class BrowserModule(Component):
 
     def get_navigation_items(self, req):
         rm = RepositoryManager(self.env)
-        if 'BROWSER_VIEW' in req.perm and rm.get_real_repositories():
+        if any(repos.is_viewable(req.perm) for repos
+                                           in rm.get_real_repositories()):
             yield ('mainnav', 'browser',
                    tag.a(_('Browse Source'), href=req.href.browser()))
 
@@ -327,8 +327,6 @@ class BrowserModule(Component):
             return True
 
     def process_request(self, req):
-        req.perm.require('BROWSER_VIEW')
-
         presel = req.args.get('preselected')
         if presel and (presel + '/').startswith(req.href.browser() + '/'):
             req.redirect(presel)
@@ -337,8 +335,9 @@ class BrowserModule(Component):
         rev = req.args.get('rev', '')
         if rev.lower() in ('', 'head'):
             rev = None
+        format = req.args.get('format')
         order = req.args.get('order', 'name').lower()
-        desc = req.args.has_key('desc')
+        desc = 'desc' in req.args
         xhr = req.get_header('X-Requested-With') == 'XMLHttpRequest'
 
         rm = RepositoryManager(self.env)
@@ -365,6 +364,7 @@ class BrowserModule(Component):
         # Find node for the requested path/rev
         context = web_context(req)
         node = None
+        changeset = None
         display_rev = lambda rev: rev
         if repos:
             try:
@@ -375,8 +375,13 @@ class BrowserModule(Component):
                 rev_or_latest = rev or repos.youngest_rev
                 node = get_existing_node(req, repos, path, rev_or_latest)
             except NoSuchChangeset, e:
-                raise ResourceNotFound(e.message,
-                                       _('Invalid changeset number'))
+                raise ResourceNotFound(e, _('Invalid changeset number'))
+            if node:
+                try:
+                    # use changeset instance to retrieve branches and tags
+                    changeset = repos.get_changeset(node.rev)
+                except NoSuchChangeset:
+                    pass
 
             context = context.child(repos.resource.child('source', path,
                                                    version=rev_or_latest))
@@ -391,13 +396,25 @@ class BrowserModule(Component):
             repo_data = self._render_repository_index(
                                         context, all_repositories, order, desc)
         if node:
+            if not node.is_viewable(req.perm):
+                raise PermissionError('BROWSER_VIEW' if node.isdir else
+                                      'FILE_VIEW', node.resource, self.env)
             if node.isdir:
+                if format in ('zip',): # extension point here...
+                    self._render_zip(req, context, repos, node, rev)
+                    # not reached
                 dir_data = self._render_dir(req, repos, node, rev, order, desc)
             elif node.isfile:
                 file_data = self._render_file(req, context, repos, node, rev)
 
         if not repos and not (repo_data and repo_data['repositories']):
-            raise ResourceNotFound(_("No node %(path)s", path=path))
+            # If no viewable repositories, check permission instead of
+            # repos.is_viewable()
+            req.perm.require('BROWSER_VIEW')
+            if show_index:
+                raise ResourceNotFound(_("No viewable repositories"))
+            else:
+                raise ResourceNotFound(_("No node %(path)s", path=path))
 
         quickjump_data = properties_data = None
         if node and not xhr:
@@ -409,7 +426,7 @@ class BrowserModule(Component):
             'context': context, 'reponame': reponame, 'repos': repos,
             'repoinfo': all_repositories.get(reponame or ''),
             'path': path, 'rev': node and node.rev, 'stickyrev': rev,
-            'display_rev': display_rev,
+            'display_rev': display_rev, 'changeset': changeset,
             'created_path': node and node.created_path,
             'created_rev': node and node.created_rev,
             'properties': properties_data,
@@ -500,6 +517,10 @@ class BrowserModule(Component):
                 continue
             try:
                 repos = rm.get_repository(reponame)
+            except TracError, err:
+                entry = (reponame, repoinfo, None, None,
+                         exception_to_unicode(err), None)
+            else:
                 if repos:
                     if not repos.is_viewable(context.perm):
                         continue
@@ -518,10 +539,7 @@ class BrowserModule(Component):
                              raw_href)
                 else:
                     entry = (reponame, repoinfo, None, None, u"\u2013", None)
-            except TracError, err:
-                entry = (reponame, repoinfo, None, None,
-                         exception_to_unicode(err), None)
-            if entry[-1] is not None:   # Check permission in case of error
+            if entry[4] is not None:  # Check permission in case of error
                 root = Resource('repository', reponame).child('source', '/')
                 if 'BROWSER_VIEW' not in context.perm(root):
                     continue
@@ -568,7 +586,7 @@ class BrowserModule(Component):
         if rev:
             newest = repos.get_changeset(rev).date
         else:
-            newest = datetime.now(req.tz)
+            newest = datetime_now(req.tz)
 
         # Color scale for the age column
         timerange = custom_colorizer = None
@@ -620,13 +638,35 @@ class BrowserModule(Component):
                                    timerange.to_seconds(timerange.oldest)),
                 }
 
+    def _iter_nodes(self, node):
+        stack = [node]
+        while stack:
+            node = stack.pop()
+            yield node
+            if node.isdir:
+                stack.extend(sorted(node.get_entries(),
+                                    key=lambda x: x.name,
+                                    reverse=True))
+
+    def _render_zip(self, req, context, repos, root_node, rev=None):
+        if not self.is_path_downloadable(repos, root_node.path):
+            raise TracError(_("Path not available for download"))
+        req.perm(context.resource).require('FILE_VIEW')
+        root_path = root_node.path.rstrip('/')
+        if root_path:
+            archive_name = root_node.name
+        else:
+            archive_name = repos.reponame or 'repository'
+        filename = '%s-%s.zip' % (archive_name, root_node.rev)
+        render_zip(req, filename, repos, root_node, self._iter_nodes)
+
     def _render_file(self, req, context, repos, node, rev=None):
         req.perm(node.resource).require('FILE_VIEW')
 
         mimeview = Mimeview(self.env)
 
         # MIME type detection
-        content = node.get_content()
+        content = node.get_processed_content()
         chunk = content.read(CHUNK_SIZE)
         mime_type = node.content_type
         if not mime_type or mime_type == 'application/octet-stream':
@@ -639,7 +679,6 @@ class BrowserModule(Component):
             req.send_response(200)
             req.send_header('Content-Type',
                             'text/plain' if format == 'txt' else mime_type)
-            req.send_header('Content-Length', node.content_length)
             req.send_header('Last-Modified', http_date(node.last_modified))
             if rev is None:
                 req.send_header('Pragma', 'no-cache')
@@ -651,12 +690,12 @@ class BrowserModule(Component):
                 # XSS attacks
                 req.send_header('Content-Disposition', 'attachment')
             req.end_headers()
-
-            while 1:
-                if not chunk:
-                    raise RequestDone
+            # Note: don't pass an iterable instance to RequestDone, instead
+            # call req.write() with each chunk here to avoid SEGVs (#11805)
+            while chunk:
                 req.write(chunk)
                 chunk = content.read(CHUNK_SIZE)
+            raise RequestDone
         else:
             # The changeset corresponding to the last change on `node`
             # is more interesting than the `rev` changeset.
@@ -675,10 +714,10 @@ class BrowserModule(Component):
             add_link(req, 'alternate', raw_href, _('Original Format'),
                      mime_type)
 
-            self.log.debug("Rendering preview of node %s@%s with mime-type %s"
-                           % (node.name, str(rev), mime_type))
+            self.log.debug("Rendering preview of node %s@%s with mime-type %s",
+                           node.name, rev, mime_type)
 
-            del content # the remainder of that content is not needed
+            content = None # the remainder of that content is not needed
 
             add_stylesheet(req, 'common/css/code.css')
 
@@ -686,7 +725,8 @@ class BrowserModule(Component):
             annotate = req.args.get('annotate')
             if annotate:
                 annotations.insert(0, annotate)
-            preview_data = mimeview.preview_data(context, node.get_content(),
+            preview_data = mimeview.preview_data(context,
+                                                 node.get_processed_content(),
                                                  node.get_content_length(),
                                                  mime_type, node.created_path,
                                                  raw_href,
@@ -704,17 +744,18 @@ class BrowserModule(Component):
         if node is not None and node.isfile:
             return href.export(rev or 'HEAD', repos.reponame or None,
                                node.path)
-        path = npath = '' if node is None else node.path.strip('/')
-        if repos.reponame:
-            path = (repos.reponame + '/' + npath).rstrip('/')
-        if any(fnmatchcase(path, p.strip('/'))
-               for p in self.downloadable_paths):
-            return href.changeset(rev or repos.youngest_rev,
-                                  repos.reponame or None, npath,
-                                  old=rev, old_path=repos.reponame or '/',
-                                  format='zip')
+        path = '' if node is None else node.path.strip('/')
+        if self.is_path_downloadable(repos, path):
+            return href.browser(repos.reponame or None, path,
+                                rev=rev or repos.youngest_rev, format='zip')
 
     # public methods
+
+    def is_path_downloadable(self, repos, path):
+        if repos.reponame:
+            path = repos.reponame + '/' + path
+        return any(fnmatchcase(path, dp.strip('/'))
+                   for dp in self.downloadable_paths)
 
     def render_properties(self, mode, context, props):
         """Prepare rendering of a collection of properties."""

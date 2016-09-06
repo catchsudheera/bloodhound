@@ -1,3 +1,16 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2004-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
+
 import difflib
 import os
 import re
@@ -12,11 +25,9 @@ try:
 except ImportError:
     pass
 
-from datetime import datetime
-
-from trac.core import *
+from trac.core import Component, TracError, implements
 from trac.test import Mock, MockPerm, EnvironmentStub, locale_en
-from trac.util.datefmt import utc
+from trac.util.datefmt import datetime_now, utc
 from trac.util.html import html
 from trac.util.text import strip_line_ws, to_unicode
 from trac.web.chrome import web_context
@@ -88,6 +99,14 @@ class WikiProcessorSampleMacro(WikiMacroBase):
                 ''.join('<dt>%s</dt><dd>%s</dd>' % kv for kv in args.items()) \
                 + content
 
+class ValueErrorWithUtf8Macro(WikiMacroBase):
+    def expand_macro(self, formatter, name, content, args):
+        raise ValueError(content.encode('utf-8'))
+
+class TracErrorWithUnicodeMacro(WikiMacroBase):
+    def expand_macro(self, formatter, name, content, args):
+        raise TracError(unicode(content))
+
 class SampleResolver(Component):
     """A dummy macro returning a div block, used by the unit test."""
 
@@ -125,48 +144,52 @@ class WikiTestCase(unittest.TestCase):
         self._setup = setup
         self._teardown = teardown
 
-        req = Mock(href=Href('/'), abs_href=Href('http://www.example.com/'),
-                   authname='anonymous', perm=MockPerm(), tz=utc, args={},
-                   locale=locale_en, lc_time=locale_en)
+        self.req = Mock(href=Href('/'),
+                        abs_href=Href('http://www.example.com/'),
+                        chrome={}, session={}, authname='anonymous',
+                        perm=MockPerm(), tz=utc, args={}, locale=locale_en,
+                        lc_time=locale_en)
         if context:
             if isinstance(context, tuple):
-                context = web_context(req, *context)
+                context = web_context(self.req, *context)
         else:
-            context = web_context(req, 'wiki', 'WikiStart')
+            context = web_context(self.req, 'wiki', 'WikiStart')
         self.context = context
 
+    def _create_env(self):
         all_test_components = [
                 HelloWorldMacro, DivHelloWorldMacro, TableHelloWorldMacro,
                 DivCodeMacro, DivCodeElementMacro, DivCodeStreamMacro,
                 NoneMacro, WikiProcessorSampleMacro, SampleResolver]
-        self.env = EnvironmentStub(enable=['trac.*'] + all_test_components)
+        env = EnvironmentStub(enable=['trac.*'] + all_test_components)
         # -- macros support
-        self.env.path = ''
+        env.path = ''
         # -- intertrac support
-        self.env.config.set('intertrac', 'trac.title', "Trac's Trac")
-        self.env.config.set('intertrac', 'trac.url',
-                            "http://trac.edgewall.org")
-        self.env.config.set('intertrac', 't', 'trac')
-        self.env.config.set('intertrac', 'th.title', "Trac Hacks")
-        self.env.config.set('intertrac', 'th.url',
-                            "http://trac-hacks.org")
-        self.env.config.set('intertrac', 'th.compat', 'false')
+        env.config.set('intertrac', 'trac.title', "Trac's Trac")
+        env.config.set('intertrac', 'trac.url',
+                       "http://trac.edgewall.org")
+        env.config.set('intertrac', 't', 'trac')
+        env.config.set('intertrac', 'th.title', "Trac Hacks")
+        env.config.set('intertrac', 'th.url',
+                       "http://trac-hacks.org")
+        env.config.set('intertrac', 'th.compat', 'false')
         # -- safe schemes
-        self.env.config.set('wiki', 'safe_schemes',
-                            'file,ftp,http,https,svn,svn+ssh,'
-                            'rfc-2396.compatible,rfc-2396+under_score')
+        env.config.set('wiki', 'safe_schemes',
+                       'file,ftp,http,https,svn,svn+ssh,'
+                       'rfc-2396.compatible,rfc-2396+under_score')
+        return env
 
+    def setUp(self):
+        self.env = self._create_env()
         # TODO: remove the following lines in order to discover
         #       all the places were we should use the req.href
         #       instead of env.href
-        self.env.href = req.href
-        self.env.abs_href = req.abs_href
-
-    def setUp(self):
+        self.env.href = self.req.href
+        self.env.abs_href = self.req.abs_href
         wiki = WikiPage(self.env)
         wiki.name = 'WikiStart'
         wiki.text = '--'
-        wiki.save('joe', 'Entry page', '::1', datetime.now(utc))
+        wiki.save('joe', 'Entry page', '::1', datetime_now(utc))
         if self._setup:
             self._setup(self)
 
@@ -182,7 +205,7 @@ class WikiTestCase(unittest.TestCase):
         v = v.replace('\r', '').replace(u'\u200b', '') # FIXME: keep ZWSP
         v = strip_line_ws(v, leading=False)
         try:
-            self.assertEquals(self.correct, v)
+            self.assertEqual(self.correct, v)
         except AssertionError, e:
             msg = to_unicode(e)
             match = re.match(r"u?'(.*)' != u?'(.*)'", msg)
@@ -289,5 +312,5 @@ def suite(data=None, setup=None, file=__file__, teardown=None, context=None):
                 print 'no ', testfile
     return suite
 
-if __name__ == '__main__':
+if __name__ == '__main__': # pragma: no cover
     unittest.main(defaultTest='suite')

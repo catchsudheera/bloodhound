@@ -19,7 +19,10 @@
 
 from __future__ import with_statement
 
+from cStringIO import StringIO
+import csv
 import errno
+import functools
 import inspect
 from itertools import izip, tee
 import locale
@@ -29,14 +32,14 @@ import random
 import re
 import shutil
 import sys
+import struct
 import tempfile
-import time
 from urllib import quote, unquote, urlencode
 
 from .compat import any, md5, sha1, sorted
+from .datefmt import time_now, to_datetime, to_timestamp, utc
 from .text import exception_to_unicode, to_unicode, getpreferredencoding
 
-# -- req, session and web utils
 
 def get_reporter_id(req, arg_name=None):
     """Get most informative "reporter" identity out of a request.
@@ -60,6 +63,7 @@ def get_reporter_id(req, arg_name=None):
     if name and email:
         return '%s <%s>' % (name, email)
     return name or email or req.authname # == 'anonymous'
+
 
 def content_disposition(type=None, filename=None):
     """Generate a properly escaped Content-Disposition header."""
@@ -166,15 +170,15 @@ class AtomicFile(object):
     """
     def __init__(self, path, mode='w', bufsize=-1):
         self._file = None
-        self._path = path
-        (dir, name) = os.path.split(path)
-        (fd, self._temp) = tempfile.mkstemp(prefix=name + '-', dir=dir)
+        self._path = os.path.realpath(path)
+        dir, name = os.path.split(self._path)
+        fd, self._temp = tempfile.mkstemp(prefix=name + '-', dir=dir)
         self._file = os.fdopen(fd, mode, bufsize)
 
         # Try to preserve permissions and group ownership, but failure
         # should not be fatal
         try:
-            st = os.stat(path)
+            st = os.stat(self._path)
             if hasattr(os, 'chmod'):
                 os.chmod(self._temp, st.st_mode)
             if hasattr(os, 'chflags') and hasattr(st, 'st_flags'):
@@ -255,7 +259,90 @@ def create_unique_file(path):
             path = '%s.%d%s' % (parts[0], idx, parts[1])
 
 
-class NaivePopen:
+if os.name == 'nt':
+    def touch_file(filename):
+        """Update modified time of the given file. The file is created if
+        missing."""
+        # Use f.truncate() to avoid low resolution of GetSystemTime()
+        # on Windows
+        with open(filename, 'ab') as f:
+            stat = os.fstat(f.fileno())
+            f.truncate(stat.st_size)
+else:
+    def touch_file(filename):
+        """Update modified time of the given file. The file is created if
+        missing."""
+        try:
+            os.utime(filename, None)
+        except OSError, e:
+            if e.errno == errno.ENOENT:
+                with open(filename, 'ab'):
+                    pass
+
+
+def create_zipinfo(filename, mtime=None, dir=False, executable=False, symlink=False,
+                   comment=None):
+    """Create a instance of `ZipInfo`.
+
+    :param filename: file name of the entry
+    :param mtime: modified time of the entry
+    :param dir: if `True`, the entry is a directory
+    :param executable: if `True`, the entry is a executable file
+    :param symlink: if `True`, the entry is a symbolic link
+    :param comment: comment of the entry
+    """
+    from zipfile import ZipInfo, ZIP_DEFLATED, ZIP_STORED
+    zipinfo = ZipInfo()
+
+    # The general purpose bit flag 11 is used to denote
+    # UTF-8 encoding for path and comment. Only set it for
+    # non-ascii files for increased portability.
+    # See http://www.pkware.com/documents/casestudies/APPNOTE.TXT
+    if any(ord(c) >= 128 for c in filename):
+        zipinfo.flag_bits |= 0x0800
+    zipinfo.filename = filename.encode('utf-8')
+
+    if mtime is not None:
+        mtime = to_datetime(mtime, utc)
+        zipinfo.date_time = mtime.utctimetuple()[:6]
+        # The "extended-timestamp" extra field is used for the
+        # modified time of the entry in unix time. It avoids
+        # extracting wrong modified time if non-GMT timezone.
+        # See http://www.opensource.apple.com/source/zip/zip-6/unzip/unzip
+        #     /proginfo/extra.fld
+        zipinfo.extra += struct.pack(
+            '<hhBl',
+            0x5455,                 # extended-timestamp extra block type
+            1 + 4,                  # size of this block
+            1,                      # modification time is present
+            to_timestamp(mtime))    # time of last modification
+
+    # external_attr is 4 bytes in size. The high order two
+    # bytes represent UNIX permission and file type bits,
+    # while the low order two contain MS-DOS FAT file
+    # attributes, most notably bit 4 marking directories.
+    if dir:
+        if not zipinfo.filename.endswith('/'):
+            zipinfo.filename += '/'
+        zipinfo.compress_type = ZIP_STORED
+        zipinfo.external_attr = 040755 << 16L        # permissions drwxr-xr-x
+        zipinfo.external_attr |= 0x10                # MS-DOS directory flag
+    else:
+        zipinfo.compress_type = ZIP_DEFLATED
+        zipinfo.external_attr = 0644 << 16L          # permissions -r-wr--r--
+        if executable:
+            zipinfo.external_attr |= 0755 << 16L     # -rwxr-xr-x
+        if symlink:
+            zipinfo.compress_type = ZIP_STORED
+            zipinfo.external_attr |= 0120000 << 16L  # symlink file type
+
+    if comment:
+        zipinfo.comment = comment.encode('utf-8')
+
+    return zipinfo
+
+
+class NaivePopen(object):
     """This is a deadlock-safe version of popen that returns an object with
     errorlevel, out (a string) and err (a string).
 
@@ -283,13 +370,9 @@ class NaivePopen:
         try:
             self.err = None
             self.errorlevel = os.system(command) >> 8
-            outfd = file(outfile, 'r')
-            self.out = outfd.read()
-            outfd.close()
+            self.out = read_file(outfile)
             if capturestderr:
-                errfd = file(errfile,'r')
-                self.err = errfd.read()
-                errfd.close()
+                self.err = read_file(errfile)
         finally:
             if os.path.isfile(outfile):
                 os.remove(outfile)
@@ -297,6 +380,38 @@ class NaivePopen:
                 os.remove(infile)
             if capturestderr and os.path.isfile(errfile):
                 os.remove(errfile)
+
+
+def terminate(process):
+    """Python 2.5 compatibility method.
+    os.kill is not available on Windows before Python 2.7.
+    In Python 2.6 subprocess.Popen has a terminate method.
+    (It also seems to have some issues on Windows though.)
+    """
+
+    def terminate_win(process):
+        import ctypes
+        PROCESS_TERMINATE = 1
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE,
+                                                    False,
+                                                    process.pid)
+        ctypes.windll.kernel32.TerminateProcess(handle, -1)
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+    def terminate_nix(process):
+        import os
+        import signal
+        try:
+            os.kill(process.pid, signal.SIGTERM)
+        except OSError, e:
+            # If the process has already finished and has not been
+            # waited for, killing it raises an ESRCH error on Cygwin
+            if e.errno != errno.ESRCH:
+                raise
+
+    if sys.platform == 'win32':
+        return terminate_win(process)
+    return terminate_nix(process)
 
 
 def makedirs(path, overwrite=False):
@@ -355,8 +470,8 @@ def copytree(src, dst, symlinks=False, skip=[], overwrite=False):
                 errors.extend(err.args[0])
         try:
             shutil.copystat(src, dst)
-        except WindowsError, why:
-            pass # Ignore errors due to limited Windows copystat support
+        except WindowsError:
+            pass  # Ignore errors due to limited Windows copystat support
         except OSError, why:
             errors.append((src, dst, str(why)))
         if errors:
@@ -424,7 +539,6 @@ def get_last_traceback():
 
 
 _egg_path_re = re.compile(r'build/bdist\.[^/]+/egg/(.*)')
-
 def get_lines_from_file(filename, lineno, context=0, globals=None):
     """Return `content` number of lines before and after the specified
     `lineno` from the (source code) file identified by `filename`.
@@ -468,10 +582,10 @@ def get_lines_from_file(filename, lineno, context=0, globals=None):
             break
 
     before = [to_unicode(l.rstrip('\n'), charset)
-                 for l in lines[lbound:lineno]]
+              for l in lines[lbound:lineno]]
     line = to_unicode(lines[lineno].rstrip('\n'), charset)
-    after = [to_unicode(l.rstrip('\n'), charset) \
-                 for l in lines[lineno + 1:ubound]]
+    after = [to_unicode(l.rstrip('\n'), charset)
+             for l in lines[lineno + 1:ubound]]
 
     return before, line, after
 
@@ -513,7 +627,7 @@ def safe__import__(module_name):
         return __import__(module_name, globals(), locals(), [])
     except Exception, e:
         for modname in sys.modules.copy():
-            if not already_imported.has_key(modname):
+            if modname not in already_imported:
                 del(sys.modules[modname])
         raise e
 
@@ -541,15 +655,14 @@ def get_doc(obj):
     """
     doc = inspect.getdoc(obj)
     if not doc:
-        return (None, None)
+        return None, None
     doc = to_unicode(doc).split('\n\n', 1)
     summary = doc[0].replace('\n', ' ')
     description = doc[1] if len(doc) > 1 else None
-    return (summary, description)
+    return summary, description
 
 
 _dont_import = frozenset(['__file__', '__name__', '__package__'])
-
 def import_namespace(globals_dict, module_name):
     """Import the namespace of a module into a globals dict.
 
@@ -582,22 +695,30 @@ def get_module_path(module):
             break
     return base_path
 
+
 def get_sources(path):
     """Return a dictionary mapping Python module source paths to the
     distributions that contain them.
     """
     sources = {}
     for dist in find_distributions(path, only=True):
-        try:
-            toplevels = dist.get_metadata('top_level.txt').splitlines()
-            toplevels = [each + '/' for each in toplevels]
-            files = dist.get_metadata('SOURCES.txt').splitlines()
-            sources.update((src, dist) for src in files
-                           if any(src.startswith(toplevel)
-                                  for toplevel in toplevels))
-        except (KeyError, IOError):
-            pass    # Metadata not found
+        if not dist.has_metadata('top_level.txt'):
+            continue
+        toplevels = dist.get_metadata_lines('top_level.txt')
+        toplevels = [top + '/' for top in toplevels]
+        if dist.has_metadata('SOURCES.txt'):  # *.egg-info/SOURCES.txt
+            sources.update((src, dist)
+                           for src in dist.get_metadata_lines('SOURCES.txt')
+                           if any(src.startswith(top) for top in toplevels))
+            continue
+        if dist.has_metadata('RECORD'):  # *.dist-info/RECORD
+            reader = csv.reader(StringIO(dist.get_metadata('RECORD')))
+            sources.update((row[0], dist)
+                           for row in reader if any(row[0].startswith(top)
+                                                    for top in toplevels))
+            continue
     return sources
+
 
 def get_pkginfo(dist):
     """Get a dictionary containing package information for a package
@@ -611,33 +732,76 @@ def get_pkginfo(dist):
     """
     import types
     if isinstance(dist, types.ModuleType):
+        def has_resource(dist, resource_name):
+            if dist.location.endswith('.egg'):  # installed by easy_install
+                return dist.has_resource(resource_name)
+            if dist.has_metadata('installed-files.txt'):  # installed by pip
+                resource_name = os.path.normpath('../' + resource_name)
+                return any(resource_name == os.path.normpath(name)
+                           for name
+                           in dist.get_metadata_lines('installed-files.txt'))
+            if dist.has_metadata('SOURCES.txt'):
+                resource_name = os.path.normpath(resource_name)
+                return any(resource_name == os.path.normpath(name)
+                           for name in dist.get_metadata_lines('SOURCES.txt'))
+            if dist.has_metadata('RECORD'):  # *.dist-info/RECORD
+                reader = csv.reader(StringIO(dist.get_metadata('RECORD')))
+                return any(resource_name == row[0] for row in reader)
+            toplevel = resource_name.split('/')[0]
+            if dist.has_metadata('top_level.txt'):
+                return toplevel in dist.get_metadata_lines('top_level.txt')
+            return dist.key == toplevel.lower()
         module = dist
         module_path = get_module_path(module)
+        resource_name = module.__name__.replace('.', '/')
+        if os.path.basename(module.__file__) in ('__init__.py', '__init__.pyc',
+                                                 '__init__.pyo'):
+            resource_name += '/__init__.py'
+        else:
+            resource_name += '.py'
         for dist in find_distributions(module_path, only=True):
             if os.path.isfile(module_path) or \
-                   dist.key == module.__name__.lower():
+                    has_resource(dist, resource_name):
                 break
         else:
             return {}
     import email
+    from trac.util.translation import _
     attrs = ('author', 'author-email', 'license', 'home-page', 'summary',
              'description', 'version')
     info = {}
     def normalize(attr):
         return attr.lower().replace('-', '_')
+    metadata = 'METADATA' if dist.has_metadata('METADATA') else 'PKG-INFO'
     try:
-        pkginfo = email.message_from_string(dist.get_metadata('PKG-INFO'))
+        pkginfo = email.message_from_string(dist.get_metadata(metadata))
         for attr in [key for key in attrs if key in pkginfo]:
             info[normalize(attr)] = pkginfo[attr]
     except IOError, e:
-        err = 'Failed to read PKG-INFO file for %s: %s' % (dist, e)
+        err = _("Failed to read %(metadata)s file for %(dist)s: %(err)s",
+                metadata=metadata, dist=dist, err=to_unicode(e))
         for attr in attrs:
             info[normalize(attr)] = err
     except email.Errors.MessageError, e:
-        err = 'Failed to parse PKG-INFO file for %s: %s' % (dist, e)
+        err = _("Failed to parse %(metadata)s file for %(dist)s: %(err)s",
+                metadata=metadata, dist=dist, err=to_unicode(e))
         for attr in attrs:
             info[normalize(attr)] = err
     return info
+
+
+def warn_setuptools_issue(out=None):
+    if not out:
+        out = sys.stderr
+    import setuptools
+    from pkg_resources import parse_version as parse
+    if parse('5.4') <= parse(setuptools.__version__) < parse('5.7') and \
+            not os.environ.get('PKG_RESOURCES_CACHE_ZIP_MANIFESTS'):
+        out.write("Warning: Detected setuptools version %s. The environment "
+                  "variable 'PKG_RESOURCES_CACHE_ZIP_MANIFESTS' must be set "
+                  "to avoid significant performance degradation.\n"
+                  % setuptools.__version__)
+
 
 # -- crypto utils
 
@@ -650,7 +814,7 @@ except NotImplementedError:
 
     def urandom(n):
         result = []
-        hasher = sha1(str(os.getpid()) + str(time.time()))
+        hasher = sha1(str(os.getpid()) + str(time_now()))
         while len(result) * hasher.digest_size < n:
             hasher.update(str(_entropy.random()))
             result.append(hasher.digest())
@@ -662,6 +826,7 @@ def hex_entropy(digits=32):
     """Generate `digits` number of hex digits of entropy."""
     result = ''.join('%.2x' % ord(v) for v in urandom((digits + 1) // 2))
     return result[:digits] if len(result) > digits else result
+
 
 # Original license for md5crypt:
 # Based on FreeBSD src/lib/libcrypt/crypt.c 1.2
@@ -851,15 +1016,15 @@ class Ranges(object):
         p.sort()
         i = 0
         while i + 1 < len(p):
-            if p[i+1][0]-1 <= p[i][1]: # this item overlaps with the next
+            if p[i+1][0]-1 <= p[i][1]:  # this item overlaps with the next
                 # make the first include the second
                 p[i] = (p[i][0], max(p[i][1], p[i+1][1]))
-                del p[i+1] # delete the second, after adjusting my endpoint
+                del p[i+1]  # delete the second, after adjusting my endpoint
             else:
                 i += 1
         if p:
-            self.a = p[0][0] # min value
-            self.b = p[-1][1] # max value
+            self.a = p[0][0]   # min value
+            self.b = p[-1][1]  # max value
         else:
             self.a = self.b = None
 
@@ -983,17 +1148,29 @@ def to_ranges(revs):
 
 
 class lazy(object):
-    """A lazily-evaluated attribute"""
+    """A lazily-evaluated attribute.
+
+    :since: 1.0
+    """
 
     def __init__(self, fn):
         self.fn = fn
+        functools.update_wrapper(self, fn)
 
     def __get__(self, instance, owner):
         if instance is None:
             return self
+        if self.fn.__name__ in instance.__dict__:
+            return instance.__dict__[self.fn.__name__]
         result = self.fn(instance)
-        setattr(instance, self.fn.__name__, result)
+        instance.__dict__[self.fn.__name__] = result
         return result
+
+    def __set__(self, instance, value):
+        instance.__dict__[self.fn.__name__] = value
+
+    def __delete__(self, instance):
+        del instance.__dict__[self.fn.__name__]
 
 
 # -- algorithmic utilities
@@ -1005,6 +1182,7 @@ def embedded_numbers(s):
     pieces = DIGITS.split(s)
     pieces[1::2] = map(int, pieces[1::2])
     return pieces
+
 
 def pairwise(iterable):
     """
@@ -1020,6 +1198,7 @@ def pairwise(iterable):
     except StopIteration:
         pass
     return izip(a, b)
+
 
 def partition(iterable, order=None):
     """
@@ -1038,6 +1217,7 @@ def partition(iterable, order=None):
         return result
     return [result[key] for key in order]
 
+
 def as_int(s, default, min=None, max=None):
     """Convert s to an int and limit it to the given range, or return default
     if unsuccessful."""
@@ -1050,6 +1230,7 @@ def as_int(s, default, min=None, max=None):
     if max is not None and value > max:
         value = max
     return value
+
 
 def as_bool(value):
     """Convert the given value to a `bool`.
@@ -1068,9 +1249,17 @@ def as_bool(value):
     except (TypeError, ValueError):
         return False
 
+
 def pathjoin(*args):
     """Strip `/` from the arguments and join them with a single `/`."""
     return '/'.join(filter(None, (each.strip('/') for each in args if each)))
+
+
+def to_list(splittable, sep=','):
+    """Split a string at `sep` and return a list without any empty items.
+    """
+    split = [x.strip() for x in splittable.split(sep)]
+    return [item for item in split if item]
 
 
 # Imports for backward compatibility (at bottom to avoid circular dependencies)

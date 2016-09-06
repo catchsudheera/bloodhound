@@ -16,12 +16,19 @@ import re
 
 from genshi import Markup, HTML, escape, unescape
 from genshi.core import stripentities, striptags, START, END
-from genshi.builder import Element, ElementFactory, Fragment
+from genshi.builder import Element, ElementFactory, Fragment, tag
 from genshi.filters.html import HTMLSanitizer
 from genshi.input import ParseError
+try:
+    from babel.support import LazyProxy
+except ImportError:
+    LazyProxy = None
 
-__all__ = ['escape', 'unescape', 'html', 'plaintext', 'find_element',
-           'TracHTMLSanitizer', 'Deuglifier', 'FormTokenInjector']
+from trac.core import TracError
+from trac.util.text import to_unicode
+
+__all__ = ['Deuglifier', 'FormTokenInjector', 'TracHTMLSanitizer', 'escape',
+           'find_element', 'html', 'plaintext', 'to_fragment', 'unescape']
 
 
 class TracHTMLSanitizer(HTMLSanitizer):
@@ -39,15 +46,17 @@ class TracHTMLSanitizer(HTMLSanitizer):
         'background', 'background-attachment', 'background-color',
         'background-image', 'background-position', 'background-repeat',
         'border', 'border-bottom', 'border-bottom-color',
-        'border-bottom-style', 'border-bottom-width', 'border-collapse',
-        'border-color', 'border-left', 'border-left-color',
-        'border-left-style', 'border-left-width', 'border-right',
-        'border-right-color', 'border-right-style', 'border-right-width',
-        'border-spacing', 'border-style', 'border-top', 'border-top-color',
+        'border-bottom-style', 'border-bottom-left-radius',
+        'border-bottom-right-radius', 'border-bottom-width',
+        'border-collapse', 'border-color', 'border-left', 'border-left-color',
+        'border-left-style', 'border-left-width', 'border-radius',
+        'border-right', 'border-right-color', 'border-right-style',
+        'border-right-width', 'border-spacing', 'border-style', 'border-top',
+        'border-top-color', 'border-top-left-radius', 'border-top-right-radius',
         'border-top-style', 'border-top-width', 'border-width', 'bottom',
         'caption-side', 'clear', 'clip', 'color', 'content',
-        'counter-increment', 'counter-reset', 'cursor', 'direction', 'display',
-        'empty-cells', 'float', 'font', 'font-family', 'font-size',
+        'counter-increment', 'counter-reset', 'cursor', 'direction',
+        'display', 'empty-cells', 'float', 'font', 'font-family', 'font-size',
         'font-style', 'font-variant', 'font-weight', 'height', 'left',
         'letter-spacing', 'line-height', 'list-style', 'list-style-image',
         'list-style-position', 'list-style-type', 'margin', 'margin-bottom',
@@ -282,6 +291,18 @@ class TransposingElementFactory(ElementFactory):
 html = TransposingElementFactory(str.lower)
 
 
+try:
+    escape('', False)  # detect genshi:#439 on Genshi 0.6 with speedups
+except TypeError:
+    _escape = escape
+
+    def escape(text, quotes=True):
+        if text:
+            return _escape(text, quotes=quotes)
+        else:
+            return Markup(u'')
+
+
 def plaintext(text, keeplinebreaks=True):
     """Extract the text elements from (X)HTML content
 
@@ -297,18 +318,20 @@ def plaintext(text, keeplinebreaks=True):
     return text
 
 
-def find_element(frag, attr=None, cls=None):
-    """Return the first element in the fragment having the given attribute or
-    class, using a preorder depth-first search.
+def find_element(frag, attr=None, cls=None, tag=None):
+    """Return the first element in the fragment having the given attribute,
+    class or tag, using a preorder depth-first search.
     """
     if isinstance(frag, Element):
         if attr is not None and attr in frag.attrib:
             return frag
         if cls is not None and cls in frag.attrib.get('class', '').split():
             return frag
+        if tag is not None and tag == frag.tag:
+            return frag
     if isinstance(frag, Fragment):
         for child in frag.children:
-            elt = find_element(child, attr, cls)
+            elt = find_element(child, attr, cls, tag)
             if elt is not None:
                 return elt
 
@@ -328,3 +351,15 @@ def expand_markup(stream, ctxt=None):
                 yield event
         else:
             yield event
+
+
+def to_fragment(input):
+    """Convert input to a `Fragment` object."""
+
+    while isinstance(input, Exception):
+        input = input.args[0]
+    if LazyProxy and isinstance(input, LazyProxy):
+        input = input.value
+    if isinstance(input, Fragment):
+        return input
+    return tag(to_unicode(input))

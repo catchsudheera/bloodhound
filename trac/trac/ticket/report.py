@@ -30,18 +30,17 @@ from trac.db import get_column_names
 from trac.perm import IPermissionRequestor
 from trac.resource import Resource, ResourceNotFound
 from trac.ticket.api import TicketSystem
-from trac.util import as_int, content_disposition
+from trac.util import as_bool, as_int, content_disposition
 from trac.util.datefmt import format_datetime, format_time, from_utimestamp
 from trac.util.presentation import Paginator
 from trac.util.text import exception_to_unicode, to_unicode, quote_query_string
 from trac.util.translation import _, tag_
-from trac.web.api import IRequestHandler, RequestDone
+from trac.web.api import HTTPBadRequest, IRequestHandler, RequestDone
 from trac.web.chrome import (INavigationContributor, Chrome,
                              add_ctxtnav, add_link, add_notice, add_script,
                              add_stylesheet, add_warning, auth_link,
                              web_context)
 from trac.wiki import IWikiSyntaxProvider, WikiParser
-
 
 
 SORT_COLUMN = '@SORT_COLUMN@'
@@ -53,7 +52,7 @@ def cell_value(v):
     >>> (cell_value(None), cell_value(0), cell_value(1), cell_value('v'))
     ('', '0', u'1', u'v')
     """
-    return '0' if v is 0 else unicode(v) if v else ''
+    return '0' if v == 0 else unicode(v) if v else ''
 
 
 _sql_re = re.compile(r'''
@@ -63,8 +62,10 @@ _sql_re = re.compile(r'''
     | \([^()]+\)                   # parenthesis group
 ''', re.MULTILINE | re.VERBOSE)
 
+
 def _expand_with_space(m):
     return ' ' * len(m.group(0))
+
 
 def sql_skeleton(sql):
     """Strip an SQL query to leave only its toplevel structure.
@@ -89,6 +90,7 @@ def sql_skeleton(sql):
 
 _order_by_re = re.compile(r'ORDER\s+BY', re.MULTILINE)
 
+
 def split_sql(sql, clause_re, skel=None):
     """Split an SQL query according to a toplevel clause regexp.
 
@@ -105,7 +107,6 @@ def split_sql(sql, clause_re, skel=None):
         return sql[:len(blocks[0])], sql[-len(blocks[1]):] # (before, after)
     else:
         return sql, '' # no single clause separator
-
 
 
 class ReportModule(Component):
@@ -148,13 +149,15 @@ class ReportModule(Component):
             return True
 
     def process_request(self, req):
-        req.perm.require('REPORT_VIEW')
-
         # did the user ask for any special report?
         id = int(req.args.get('id', -1))
-        action = req.args.get('action', 'view')
+        if id != -1:
+            req.perm('report', id).require('REPORT_VIEW')
+        else:
+            req.perm.require('REPORT_VIEW')
 
         data = {}
+        action = req.args.get('action', 'view')
         if req.method == 'POST':
             if action == 'new':
                 self._do_create(req)
@@ -162,9 +165,11 @@ class ReportModule(Component):
                 self._do_delete(req, id)
             elif action == 'edit':
                 self._do_save(req, id)
+            else:
+                raise HTTPBadRequest(_("Invalid request arguments."))
         elif action in ('copy', 'edit', 'new'):
             template = 'report_edit.html'
-            data = self._render_editor(req, id, action=='copy')
+            data = self._render_editor(req, id, action == 'copy')
             Chrome(self.env).add_wiki_toolbars(req)
         elif action == 'delete':
             template = 'report_delete.html'
@@ -183,17 +188,19 @@ class ReportModule(Component):
             if content_type: # i.e. alternate format
                 return template, data, content_type
 
+        from trac.ticket.query import QueryModule
+        show_query_link = 'TICKET_VIEW' in req.perm and \
+                          self.env.is_component_enabled(QueryModule)
+
         if id != -1 or action == 'new':
             add_ctxtnav(req, _('Available Reports'), href=req.href.report())
             add_link(req, 'up', req.href.report(), _('Available Reports'))
-        else:
+        elif show_query_link:
             add_ctxtnav(req, _('Available Reports'))
 
         # Kludge: only show link to custom query if the query module
         # is actually enabled
-        from trac.ticket.query import QueryModule
-        if 'TICKET_VIEW' in req.perm and \
-                self.env.is_component_enabled(QueryModule):
+        if show_query_link:
             add_ctxtnav(req, _('Custom Query'), href=req.href.query())
             data['query_href'] = req.href.query()
             data['saved_query_href'] = req.session.get('query_href')
@@ -224,7 +231,7 @@ class ReportModule(Component):
         req.redirect(req.href.report(report_id))
 
     def _do_delete(self, req, id):
-        req.perm.require('REPORT_DELETE')
+        req.perm('report', id).require('REPORT_DELETE')
 
         if 'cancel' in req.args:
             req.redirect(req.href.report(id))
@@ -235,7 +242,7 @@ class ReportModule(Component):
 
     def _do_save(self, req, id):
         """Save report changes to the database"""
-        req.perm.require('REPORT_MODIFY')
+        req.perm('report', id).require('REPORT_MODIFY')
 
         if 'cancel' not in req.args:
             title = req.args.get('title', '')
@@ -249,29 +256,18 @@ class ReportModule(Component):
         req.redirect(req.href.report(id))
 
     def _render_confirm_delete(self, req, id):
-        req.perm.require('REPORT_DELETE')
+        req.perm('report', id).require('REPORT_DELETE')
 
-        for title, in self.env.db_query("""
-                SELECT title FROM report WHERE id=%s
-                """, (id,)):
-            return {'title': _("Delete Report {%(num)s} %(title)s", num=id,
-                               title=title),
-                    'action': 'delete',
-                    'report': {'id': id, 'title': title}}
-        else:
-            raise TracError(_("Report {%(num)s} does not exist.", num=id),
-                            _("Invalid Report Number"))
+        title = self.get_report(id)[0]
+        return {'title': _("Delete Report {%(num)s} %(title)s", num=id,
+                           title=title),
+                'action': 'delete',
+                'report': {'id': id, 'title': title}}
 
     def _render_editor(self, req, id, copy):
         if id != -1:
-            req.perm.require('REPORT_MODIFY')
-            for title, description, query in self.env.db_query(
-                    "SELECT title, description, query FROM report WHERE id=%s",
-                    (id,)):
-                break
-            else:
-                raise TracError(_("Report {%(num)s} does not exist.", num=id),
-                                _("Invalid Report Number"))
+            req.perm('report', id).require('REPORT_MODIFY')
+            title, description, query = self.get_report(id)
         else:
             req.perm.require('REPORT_CREATE')
             title = description = query = ''
@@ -299,13 +295,15 @@ class ReportModule(Component):
     def _render_list(self, req):
         """Render the list of available reports."""
         sort = req.args.get('sort', 'report')
-        asc = bool(int(req.args.get('asc', 1)))
+        asc = as_bool(req.args.get('asc', 1))
         format = req.args.get('format')
 
         rows = self.env.db_query("""
                 SELECT id, title, description FROM report ORDER BY %s %s
                 """ % ('title' if sort == 'title' else 'id',
                        '' if asc else 'DESC'))
+        rows = [(id, title, description) for id, title, description in rows
+                if 'REPORT_VIEW' in req.perm('report', id)]
 
         if format == 'rss':
             data = {'rows': rows}
@@ -344,13 +342,7 @@ class ReportModule(Component):
 
     def _render_view(self, req, id):
         """Retrieve the report results and pre-process them for rendering."""
-        for title, sql, description in self.env.db_query("""
-                SELECT title, query, description from report WHERE id=%s
-                """, (id,)):
-            break
-        else:
-            raise ResourceNotFound(_("Report {%(num)s} does not exist.",
-                                     num=id), _("Invalid Report Number"))
+        title, description, sql = self.get_report(id)
         try:
             args = self.get_var_args(req)
         except ValueError, e:
@@ -393,10 +385,10 @@ class ReportModule(Component):
         title = '{%i} %s' % (id, title)
 
         report_resource = Resource('report', id)
-        req.perm.require('REPORT_VIEW', report_resource)
+        req.perm(report_resource).require('REPORT_VIEW')
         context = web_context(req, report_resource)
 
-        page = int(req.args.get('page', '1'))
+        page = as_int(req.args.get('page'), 1)
         default_max = {'rss': self.items_per_page_rss,
                        'csv': 0, 'tab': 0}.get(format, self.items_per_page)
         max = req.args.get('max')
@@ -404,8 +396,7 @@ class ReportModule(Component):
         offset = (page - 1) * limit
 
         sort_col = req.args.get('sort', '')
-        asc = req.args.get('asc', 1)
-        asc = bool(int(asc)) # string '0' or '1' to int/boolean
+        asc = as_bool(req.args.get('asc', 1))
 
         def report_href(**kwargs):
             """Generate links to this report preserving user variables,
@@ -436,13 +427,13 @@ class ReportModule(Component):
                                                 offset)
 
         if len(res) == 2:
-             e, sql = res
-             data['message'] = \
-                 tag_("Report execution failed: %(error)s %(sql)s",
-                      error=tag.pre(exception_to_unicode(e)),
-                      sql=tag(tag.hr(),
-                              tag.pre(sql, style="white-space: pre")))
-             return 'report_view.html', data, None
+            e, sql = res
+            data['message'] = \
+                tag_("Report execution failed: %(error)s %(sql)s",
+                     error=tag.pre(exception_to_unicode(e)),
+                     sql=tag(tag.hr(),
+                             tag.pre(sql, style="white-space: pre")))
+            return 'report_view.html', data, None
 
         cols, results, num_items, missing_args, limit_offset = res
         need_paginator = limit > 0 and limit_offset
@@ -469,8 +460,8 @@ class ReportModule(Component):
             fields = ['href', 'class', 'string', 'title']
             paginator.shown_pages = [dict(zip(fields, p)) for p in pagedata]
             paginator.current_page = {'href': None, 'class': 'current',
-                                    'string': str(paginator.page + 1),
-                                    'title': None}
+                                      'string': str(paginator.page + 1),
+                                      'title': None}
             numrows = paginator.num_items
 
         # Place retrieved columns in groups, according to naming conventions
@@ -609,7 +600,7 @@ class ReportModule(Component):
         if format == 'rss':
             data['email_map'] = chrome.get_email_map()
             data['context'] = web_context(req, report_resource,
-                                                   absurls=True)
+                                          absurls=True)
             return 'report.rss', data, 'application/rss+xml'
         elif format == 'csv':
             filename = 'report_%s.csv' % id if id else 'report.csv'
@@ -629,7 +620,7 @@ class ReportModule(Component):
                      _('Comma-delimited Text'), 'text/plain')
             add_link(req, 'alternate', report_href(format='tab', page=p),
                      _('Tab-delimited Text'), 'text/plain')
-            if 'REPORT_SQL_VIEW' in req.perm:
+            if 'REPORT_SQL_VIEW' in req.perm('report', id):
                 add_link(req, 'alternate',
                          req.href.report(id=id, format='sql'),
                          _('SQL Query'), 'text/plain')
@@ -692,6 +683,9 @@ class ReportModule(Component):
             try:
                 cursor.execute(count_sql, args)
             except Exception, e:
+                self.log.warn('Exception caught while executing Report {%d}: '
+                              '%r, args %r%s', id, count_sql, args,
+                              exception_to_unicode(e, traceback=True))
                 return e, count_sql
             num_items = cursor.fetchone()[0]
 
@@ -701,6 +695,9 @@ class ReportModule(Component):
             try:
                 cursor.execute(colnames_sql, args)
             except Exception, e:
+                self.log.warn('Exception caught while executing Report {%d}: '
+                              '%r, args %r%s', id, colnames_sql, args,
+                              exception_to_unicode(e, traceback=True))
                 return e, colnames_sql
             cols = get_column_names(cursor)
 
@@ -724,7 +721,7 @@ class ReportModule(Component):
                 sql = sql.replace(SORT_COLUMN, sort_col or '1')
             elif sort_col:
                 # Method 2: automagically insert sort_col (and __group__
-                # before it, if __group__ was specified) as first criterions
+                # before it, if __group__ was specified) as first criteria
                 if '__group__' in cols:
                     order_by.append('__group__ ASC')
                 order_by.append(sort_col)
@@ -752,6 +749,9 @@ class ReportModule(Component):
         try:
             cursor.execute(sql, args)
         except Exception, e:
+            self.log.warn('Exception caught while executing Report {%d}: '
+                          '%r, args %r%s', id, sql, args,
+                          exception_to_unicode(e, traceback=True))
             if order_by or limit_offset:
                 add_notice(req, _("Hint: if the report failed due to automatic"
                                   " modification of the ORDER BY clause or the"
@@ -765,6 +765,20 @@ class ReportModule(Component):
         rows = cursor.fetchall() or []
         cols = get_column_names(cursor)
         return cols, rows, num_items, missing_args, limit_offset
+
+    def get_report(self, id):
+        try:
+            number = int(id)
+        except (ValueError, TypeError):
+            pass
+        else:
+            for title, description, sql in self.env.db_query("""
+                    SELECT title, description, query from report WHERE id=%s
+                    """, (number,)):
+                return title, description, sql
+
+        raise ResourceNotFound(_("Report {%(num)s} does not exist.", num=id),
+                               _("Invalid Report Number"))
 
     def get_var_args(self, req):
         # reuse somehow for #9574 (wiki vars)
@@ -849,23 +863,37 @@ class ReportModule(Component):
             'modified': iso_datetime,
         }
 
-        converters = [col_conversions.get(c.strip('_'), cell_value)
-                      for c in cols]
+        def iterate():
+            from cStringIO import StringIO
+            out = StringIO()
+            writer = csv.writer(out, delimiter=sep, quoting=csv.QUOTE_MINIMAL)
 
-        out = StringIO()
-        out.write('\xef\xbb\xbf')       # BOM
-        writer = csv.writer(out, delimiter=sep)
-        writer.writerow([unicode(c).encode('utf-8') for c in cols
-                         if c not in self._html_cols])
-        for row in rows:
-            writer.writerow([converters[i](cell).encode('utf-8')
-                             for i, cell in enumerate(row)
-                             if cols[i] not in self._html_cols])
-        data = out.getvalue()
+            def writerow(values):
+                writer.writerow([value.encode('utf-8') for value in values])
+                rv = out.getvalue()
+                out.truncate(0)
+                return rv
+
+            converters = [col_conversions.get(c.strip('_'), cell_value)
+                          for c in cols]
+            yield '\xef\xbb\xbf'  # BOM
+            yield writerow(c for c in cols if c not in self._html_cols)
+            for row in rows:
+                yield writerow(converters[i](cell)
+                               for i, cell in enumerate(row)
+                               if cols[i] not in self._html_cols)
+
+        data = iterate()
+        if Chrome(self.env).use_chunked_encoding:
+            length = None
+        else:
+            data = ''.join(data)
+            length = len(data)
 
         req.send_response(200)
         req.send_header('Content-Type', mimetype + ';charset=utf-8')
-        req.send_header('Content-Length', len(data))
+        if length is not None:
+            req.send_header('Content-Length', length)
         if filename:
             req.send_header('Content-Disposition',
                             content_disposition('attachment', filename))
@@ -874,7 +902,7 @@ class ReportModule(Component):
         raise RequestDone
 
     def _send_sql(self, req, id, title, description, sql):
-        req.perm.require('REPORT_SQL_VIEW')
+        req.perm('report', id).require('REPORT_SQL_VIEW')
 
         out = StringIO()
         out.write('-- ## %s: %s ## --\n\n' % (id, title.encode('utf-8')))
@@ -901,8 +929,8 @@ class ReportModule(Component):
         yield ('report', self._format_link)
 
     def get_wiki_syntax(self):
-        yield (r"!?\{(?P<it_report>%s\s*)[0-9]+\}" % \
-                                                WikiParser.INTERTRAC_SCHEME,
+        yield (r"!?\{(?P<it_report>%s\s*)[0-9]+\}" %
+                   WikiParser.INTERTRAC_SCHEME,
                lambda x, y, z: self._format_link(x, 'report', y[1:-1], y, z))
 
     def _format_link(self, formatter, ns, target, label, fullmatch=None):
@@ -910,6 +938,16 @@ class ReportModule(Component):
                                                          fullmatch)
         if intertrac:
             return intertrac
-        report, args, fragment = formatter.split_link(target)
-        return tag.a(label, href=formatter.href.report(report) + args,
-                     class_='report')
+        id, args, fragment = formatter.split_link(target)
+        try:
+            self.get_report(id)
+        except ResourceNotFound:
+            return tag.a(label, class_='missing report',
+                         title=_("report does not exist"))
+        else:
+            if 'REPORT_VIEW' in formatter.req.perm('report', id):
+                return tag.a(label, href=formatter.href.report(id) + args,
+                             class_='report')
+            else:
+                return tag.a(label, class_='forbidden report',
+                             title=_("no permission to view report"))

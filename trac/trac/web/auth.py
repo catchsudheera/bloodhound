@@ -25,7 +25,6 @@ from hashlib import md5, sha1
 import os
 import re
 import sys
-import time
 import urllib2
 import urlparse
 
@@ -36,7 +35,9 @@ from trac.core import *
 from trac.web.api import IAuthenticator, IRequestHandler
 from trac.web.chrome import INavigationContributor
 from trac.util import hex_entropy, md5crypt
+from trac.util.compat import crypt
 from trac.util.concurrency import threading
+from trac.util.datefmt import time_now
 from trac.util.translation import _, tag_
 
 
@@ -86,7 +87,7 @@ class LoginModule(Component):
         authname = None
         if req.remote_user:
             authname = req.remote_user
-        elif req.incookie.has_key('trac_auth'):
+        elif 'trac_auth' in req.incookie:
             authname = self._get_name_for_cookie(req,
                                                  req.incookie['trac_auth'])
 
@@ -108,7 +109,10 @@ class LoginModule(Component):
             yield ('metanav', 'login', _('logged in as %(user)s',
                                          user=req.authname))
             yield ('metanav', 'logout',
-                   tag.a(_('Logout'), href=req.href.logout()))
+                   tag.form(tag.div(tag.button(_('Logout'),
+                                               name='logout', type='submit')),
+                            action=req.href.logout(), method='post',
+                            id='logout', class_='trac-logout'))
         else:
             yield ('metanav', 'login',
                    tag.a(_('Login'), href=req.href.login()))
@@ -155,13 +159,14 @@ class LoginModule(Component):
         if self.ignore_case:
             remote_user = remote_user.lower()
 
-        assert req.authname in ('anonymous', remote_user), \
-               _('Already logged in as %(user)s.', user=req.authname)
+        if req.authname not in ('anonymous', remote_user):
+            raise TracError(_('Already logged in as %(user)s.',
+                              user=req.authname))
 
         with self.env.db_transaction as db:
             # Delete cookies older than 10 days
             db("DELETE FROM auth_cookie WHERE time < %s",
-               (int(time.time()) - 86400 * 10,))
+               (int(time_now()) - 86400 * 10,))
             # Insert a new cookie if we haven't already got one
             cookie = None
             trac_auth = req.incookie.get('trac_auth')
@@ -174,7 +179,7 @@ class LoginModule(Component):
                     INSERT INTO auth_cookie (cookie, name, ipnr, time)
                          VALUES (%s, %s, %s, %s)
                    """, (cookie, remote_user, req.remote_addr,
-                         int(time.time())))
+                         int(time_now())))
         req.authname = remote_user
         req.outcookie['trac_auth'] = cookie
         req.outcookie['trac_auth']['path'] = self.auth_cookie_path \
@@ -192,6 +197,8 @@ class LoginModule(Component):
         Simply deletes the corresponding record from the auth_cookie
         table.
         """
+        if req.method != 'POST':
+            return
         if req.authname == 'anonymous':
             # Not logged in
             return
@@ -286,7 +293,7 @@ class PasswordFileAuthentication(HTTPAuthentication):
     def check_reload(self):
         with self._lock:
             mtime = os.stat(self.filename).st_mtime
-            if mtime > self.mtime:
+            if mtime != self.mtime:
                 self.mtime = mtime
                 self.load(self.filename)
 
@@ -296,15 +303,7 @@ class BasicAuthentication(PasswordFileAuthentication):
     def __init__(self, htpasswd, realm):
         # FIXME pass a logger
         self.realm = realm
-        try:
-            import crypt
-            self.crypt = crypt.crypt
-        except ImportError:
-            try:
-                import fcrypt
-                self.crypt = fcrypt.crypt
-            except ImportError:
-                self.crypt = None
+        self.crypt = crypt
         PasswordFileAuthentication.__init__(self, htpasswd)
 
     def load(self, filename):
@@ -429,12 +428,12 @@ class DigestAuthentication(PasswordFileAuthentication):
                          'nc', 'cnonce']
         # Invalid response?
         for key in required_keys:
-            if not auth.has_key(key):
+            if key not in auth:
                 self.send_auth_request(environ, start_response)
                 return None
         # Unknown user?
         self.check_reload()
-        if not self.hash.has_key(auth['username']):
+        if auth['username'] not in self.hash:
             self.send_auth_request(environ, start_response)
             return None
 

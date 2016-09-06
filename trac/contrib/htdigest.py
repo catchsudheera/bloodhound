@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright (C)2006-2009 Edgewall Software
+# Copyright (C) 2006-2013 Edgewall Software
 # Copyright (C) 2006 Matthew Good <matt@matt-good.net>
 # All rights reserved.
 #
@@ -45,6 +45,10 @@ parser.add_option('-c', action='store_true', dest='create', default=False,
                   help='Create a new file')
 parser.add_option('-b', action='store_true', dest='batch', default=False,
                   help='Batch mode, password on the commandline.')
+
+if len(sys.argv) <= 1:
+    parser.print_help()
+    sys.exit(1)
 
 opts, args = parser.parse_args()
 

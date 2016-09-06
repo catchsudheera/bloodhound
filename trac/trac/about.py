@@ -17,6 +17,7 @@
 # Author: Jonas Borgström <jonas@edgewall.com>
 #         Christopher Lenz <cmlenz@gmx.de>
 
+import os
 import re
 
 from genshi.builder import tag
@@ -26,7 +27,7 @@ from trac.loader import get_plugin_info
 from trac.perm import IPermissionRequestor
 from trac.util.translation import _
 from trac.web import IRequestHandler
-from trac.web.chrome import INavigationContributor
+from trac.web.chrome import Chrome, INavigationContributor
 
 
 class AboutModule(Component):
@@ -44,7 +45,7 @@ class AboutModule(Component):
 
     def get_navigation_items(self, req):
         yield ('metanav', 'about',
-               tag.a(_('About Trac'), href=req.href.about()))
+               tag.a(_('About Trac'), href=req.href.about(), accesskey=9))
 
     # IPermissionRequestor methods
 
@@ -57,15 +58,21 @@ class AboutModule(Component):
         return re.match(r'/about(?:_trac)?(?:/.+)?$', req.path_info)
 
     def process_request(self, req):
-        data = {'systeminfo': None, 'plugins': None, 'config': None}
+        data = {'systeminfo': None, 'plugins': None,
+                'config': None, 'interface': None}
 
         if 'CONFIG_VIEW' in req.perm('config', 'systeminfo'):
             # Collect system information
             data['systeminfo'] = self.env.get_systeminfo()
+            Chrome(self.env).add_jquery_ui(req)
 
         if 'CONFIG_VIEW' in req.perm('config', 'plugins'):
             # Collect plugin information
             data['plugins'] = get_plugin_info(self.env)
+
+        if 'CONFIG_VIEW' in req.perm('config', 'interface'):
+            data['interface'] = \
+                Chrome(self.env).get_interface_customization_files()
 
         if 'CONFIG_VIEW' in req.perm('config', 'ini'):
             # Collect config information

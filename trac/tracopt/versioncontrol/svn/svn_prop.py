@@ -27,6 +27,7 @@ from trac.versioncontrol.web_ui.browser import IPropertyRenderer
 from trac.versioncontrol.web_ui.changeset import IPropertyDiffRenderer
 from trac.util import Ranges, to_ranges
 from trac.util.translation import _, tag_
+from trac.web.chrome import chrome_resource_path
 from tracopt.versioncontrol.svn.svn_fs import _path_within_scope
 
 
@@ -90,14 +91,17 @@ class SubversionPropertyRenderer(Component):
         elif name == 'svn:mergeinfo' or name.startswith('svnmerge-'):
             return self._render_mergeinfo(name, mode, context, props)
 
+    def _is_abs_url(self, url):
+        return url and '://' in url
+
     def _render_externals(self, prop):
         if not self._externals_map:
             for dummykey, value in self.svn_externals_section.options():
                 value = value.split()
                 if len(value) != 2:
                     self.log.warn("svn:externals entry %s doesn't contain "
-                            "a space-separated key value pair, skipping.",
-                            dummykey)
+                                  "a space-separated key value pair, "
+                                  "skipping.", dummykey)
                     continue
                 key, value = value
                 self._externals_map[key] = value.replace('%', '%%') \
@@ -116,6 +120,9 @@ class SubversionPropertyRenderer(Component):
                 rev = elements[1]
                 rev = rev.replace('-r', '')
             # retrieve a matching entry in the externals map
+            if not self._is_abs_url(url):
+                externals.append((external, None, None, None, None))
+                continue
             prefix = []
             base_url = url
             while base_url:
@@ -153,8 +160,8 @@ class SubversionPropertyRenderer(Component):
                        for label, href, title in externals_data])
 
     def _render_needslock(self, context):
-        return tag.img(src=context.href.chrome('common/lock-locked.png'),
-                       alt="needs lock", title="needs lock")
+        url = chrome_resource_path(context.req, 'common/lock-locked.png')
+        return tag.img(src=url, alt=_("needs lock"), title=_("needs lock"))
 
     def _render_mergeinfo(self, name, mode, context, props):
         rows = []
@@ -197,6 +204,7 @@ class SubversionMergePropertyRenderer(Component):
                 if path not in branch_starts:
                     branch_starts[path] = rev + 1
         rows = []
+        eligible_infos = []
         if name.startswith('svnmerge-'):
             sources = props[name].split()
         else:
@@ -232,9 +240,9 @@ class SubversionMergePropertyRenderer(Component):
                         if blocked:
                             eligible -= set(Ranges(blocked))
                         if eligible:
-                            nrevs = repos._get_node_revs(spath, max(eligible),
-                                                         min(eligible))
-                            eligible &= set(nrevs)
+                            node = repos.get_node(spath, max(eligible))
+                            eligible_infos.append((spath, node, eligible, row))
+                            continue
                         eligible = to_ranges(eligible)
                         row.append(_get_revs_link(_('eligible'), context,
                                                   spath, eligible))
@@ -246,13 +254,31 @@ class SubversionMergePropertyRenderer(Component):
             rows.append((deleted, spath,
                          [tag.td('/' + spath),
                           tag.td(revs, colspan=revs_cols)]))
+
+        # fetch eligible revisions for each path at a time
+        changed_revs = {}
+        changed_nodes = [(node, min(eligible))
+                         for spath, node, eligible, row in eligible_infos]
+        if changed_nodes:
+            changed_revs = repos._get_changed_revs(changed_nodes)
+        for spath, node, eligible, row in eligible_infos:
+            if spath in changed_revs:
+                eligible &= set(changed_revs[spath])
+            else:
+                eligible.clear()
+            row.append(_get_revs_link(_("eligible"), context, spath,
+                                      to_ranges(eligible)))
+            rows.append((False, spath, [tag.td(each) for each in row]))
+
         if not rows:
             return None
         rows.sort()
-        has_deleted = rows[-1][0] if rows else None
-        return tag(has_deleted and tag.a(_('(toggle deleted branches)'),
-                                         class_='trac-toggledeleted',
-                                         href='#'),
+        if rows and rows[-1][0]:
+            toggledeleted = tag.a(_("(toggle deleted branches)"),
+                                  class_='trac-toggledeleted', href='#')
+        else:
+            toggledeleted = None
+        return tag(toggledeleted,
                    tag.table(tag.tbody(
                        [tag.tr(row, class_='trac-deleted' if deleted else None)
                         for deleted, spath, row in rows]), class_='props'))
@@ -330,7 +356,10 @@ class SubversionMergePropertyDiffRenderer(Component):
         repos = rm.get_repository(old_context.resource.parent.id)
         def parse_sources(props):
             sources = {}
-            for line in props[name].splitlines():
+            value = props[name]
+            lines = value.splitlines() if name == 'svn:mergeinfo' \
+                                       else value.split()
+            for line in lines:
                 path, revs = line.split(':', 1)
                 spath = _path_within_scope(repos.scope, path)
                 if spath is not None:
@@ -346,33 +375,52 @@ class SubversionMergePropertyDiffRenderer(Component):
         removed_label = [_("reverse-merged: "), _("un-blocked: ")][blocked]
         added_ni_label = _("marked as non-inheritable: ")
         removed_ni_label = _("unmarked as non-inheritable: ")
+
+        sources = []
+        changed_revs = {}
+        changed_nodes = []
+        for spath, (new_revs, new_revs_ni) in new_sources.iteritems():
+            new_spath = spath not in old_sources
+            if new_spath:
+                old_revs = old_revs_ni = set()
+            else:
+                old_revs, old_revs_ni = old_sources.pop(spath)
+            added = new_revs - old_revs
+            removed = old_revs - new_revs
+            # unless new revisions differ from old revisions
+            if not added and not removed:
+                continue
+            added_ni = new_revs_ni - old_revs_ni
+            removed_ni = old_revs_ni - new_revs_ni
+            revs = sorted(added | removed | added_ni | removed_ni)
+            try:
+                node = repos.get_node(spath, revs[-1])
+                changed_nodes.append((node, revs[0]))
+            except NoSuchNode:
+                pass
+            sources.append((spath, new_spath, added, removed, added_ni,
+                            removed_ni))
+        if changed_nodes:
+            changed_revs = repos._get_changed_revs(changed_nodes)
+
         def revs_link(revs, context):
             if revs:
                 revs = to_ranges(revs)
                 return _get_revs_link(revs.replace(',', u',\u200b'),
                                       context, spath, revs)
         modified_sources = []
-        for spath, (new_revs, new_revs_ni) in new_sources.iteritems():
-            if spath in old_sources:
-                (old_revs, old_revs_ni), status = old_sources.pop(spath), None
-            else:
-                old_revs = old_revs_ni = set()
-                status = _(' (added)')
-            added = new_revs - old_revs
-            removed = old_revs - new_revs
-            added_ni = new_revs_ni - old_revs_ni
-            removed_ni = old_revs_ni - new_revs_ni
-            try:
-                all_revs = set(repos._get_node_revs(spath))
-                # TODO: also pass first_rev here, for getting smaller a set
-                #       (this is an optmization fix, result is already correct)
-                added &= all_revs
-                removed &= all_revs
-                added_ni &= all_revs
-                removed_ni &= all_revs
-            except NoSuchNode:
-                pass
+        for spath, new_spath, added, removed, added_ni, removed_ni in sources:
+            if spath in changed_revs:
+                revs = set(changed_revs[spath])
+                added &= revs
+                removed &= revs
+                added_ni &= revs
+                removed_ni &= revs
             if added or removed:
+                if new_spath:
+                    status = _(" (added)")
+                else:
+                    status = None
                 modified_sources.append((
                     spath, [_get_source_link(spath, new_context), status],
                     added and tag(added_label, revs_link(added, new_context)),

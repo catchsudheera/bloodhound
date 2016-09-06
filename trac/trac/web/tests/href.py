@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2005-2009 Edgewall Software
+# Copyright (C) 2005-2013 Edgewall Software
 # Copyright (C) 2005-2007 Christopher Lenz <cmlenz@gmx.de>
 # All rights reserved.
 #
@@ -15,6 +15,7 @@
 import doctest
 import unittest
 
+import trac.tests.compat
 import trac.web.href
 
 
@@ -36,9 +37,9 @@ class HrefTestCase(unittest.TestCase):
         self.assertEqual('/base/sub/other/', href('sub', 'other', ''))
         self.assertEqual('/base/with%20special%26chars',
                          href('with special&chars'))
-        assert href('page', param='value', other='other value', more=None) in [
+        self.assertIn(href('page', param='value', other='other value', more=None), [
             '/base/page?param=value&other=other+value',
-            '/base/page?other=other+value&param=value']
+            '/base/page?other=other+value&param=value'])
         self.assertEqual('/base/page?param=multiple&param=values',
                          href('page', param=['multiple', 'values']))
 
@@ -73,15 +74,17 @@ class HrefTestCase(unittest.TestCase):
         self.assertEqual('/sub/other/', href('sub', 'other', ''))
         self.assertEqual('/with%20special%26chars',
                          href('with special&chars'))
-        assert href('page', param='value', other='other value', more=None) in [
-            '/page?param=value&other=other+value',
-            '/page?other=other+value&param=value']
+        self.assertIn(
+            href('page', param='value', other='other value', more=None),
+            ['/page?param=value&other=other+value',
+             '/page?other=other+value&param=value'])
         self.assertEqual('/page?param=multiple&param=values',
                          href('page', param=['multiple', 'values']))
 
         self.assertEqual('/path/to/file/', href + '/path/to/file/')
         self.assertEqual('/path/to/file', href + 'path/to/file')
         self.assertEqual('/', href + '')
+        self.assertEqual('/?name=val', href + '?name=val')
 
     def test_params_subclasses(self):
         """Parameters passed using subclasses of dict, list and tuple."""
@@ -96,19 +99,34 @@ class HrefTestCase(unittest.TestCase):
                          href(param=MyList(['test', 'other'])))
         self.assertEqual('/base?param=test&param=other',
                          href(param=MyTuple(['test', 'other'])))
-        assert href(MyDict(param='value', other='other value')) in [
+        self.assertIn(href(MyDict(param='value', other='other value')), [
             '/base?param=value&other=other+value',
-            '/base?other=other+value&param=value']
+            '/base?other=other+value&param=value'])
         self.assertEqual('/base?param=value&other=other+value',
                          href(MyList([('param', 'value'), ('other', 'other value')])))
         self.assertEqual('/base?param=value&other=other+value',
                          href(MyTuple([('param', 'value'), ('other', 'other value')])))
 
+    def test_add_unicode(self):
+        href = trac.web.href.Href('/base')
+        self.assertEqual('/base/p%C3%A4th/to/%20/file/',
+                         href + u'/päth/to/ /file/')
+        self.assertEqual('/base/p%C3%A4th/to/%20/file',
+                         href + u'päth/to/ /file')
+        self.assertEqual('/base?type=def%C3%A9ct&or&type=abc%20def',
+                         href + u'?type=deféct&or&type=abc def')
+        self.assertEqual('/base/p%C3%A4th/to/file/'
+                         '?type=def%C3%A9ct&or&type=abc%20def',
+                         href + u'/päth/to/file/?type=deféct&or&type=abc def')
+        self.assertEqual('/base/p%C3%A4th/to/file'
+                         '?type=def%C3%A9ct&or&type=abc%20def',
+                         href + u'päth/to/file?type=deféct&or&type=abc def')
+
 
 def suite():
     suite = unittest.TestSuite()
     suite.addTest(doctest.DocTestSuite(trac.web.href))
-    suite.addTest(unittest.makeSuite(HrefTestCase, 'test'))
+    suite.addTest(unittest.makeSuite(HrefTestCase))
     return suite
 
 if __name__ == '__main__':

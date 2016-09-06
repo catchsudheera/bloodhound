@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2007-2009 Edgewall Software
+# Copyright (C) 2013 Edgewall Software
 # All rights reserved.
 #
 # This software is licensed as described in the file COPYING, which
@@ -11,21 +11,16 @@
 # individuals. For the exact contribution history, see the revision
 # history and logs, available at http://trac.edgewall.org/log/.
 
-import pkg_resources
+import unittest
 
-from trac.core import *
-from trac.web.chrome import ITemplateProvider
+from tracopt.ticket.tests import commit_updater
 
 
-class VersionControlUI(Component):
+def suite():
+    suite = unittest.TestSuite()
+    suite.addTest(commit_updater.suite())
+    return suite
 
-    implements(ITemplateProvider)
 
-    # ITemplateProvider methods
-
-    def get_htdocs_dirs(self):
-        return []
-
-    def get_templates_dirs(self):
-        return [pkg_resources.resource_filename('trac.versioncontrol',
-                                                'templates')]
+if __name__ == '__main__':
+    unittest.main(defaultTest='suite')
