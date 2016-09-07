@@ -40,6 +40,7 @@ from trac.util.datefmt import datetime_now, format_datetime, from_utimestamp, \
 from trac.util.presentation import Paginator
 from trac.util.text import empty, shorten_line, quote_query_string
 from trac.util.translation import _, tag_, cleandoc_, ngettext
+from trac.util.introspection import get_enabled_component_subclass
 from trac.web import arg_list_to_args, parse_arg_list, IRequestHandler
 from trac.web.href import Href
 from trac.web.chrome import (INavigationContributor, Chrome,
@@ -900,7 +901,7 @@ class QueryModule(Component):
     def get_navigation_items(self, req):
         from trac.ticket.report import ReportModule
         if 'TICKET_VIEW' in req.perm and \
-                (not self.env.is_component_enabled(ReportModule) or
+                (get_enabled_component_subclass(self.env, ReportModule) is None or
                  'REPORT_VIEW' not in req.perm):
             yield ('mainnav', 'tickets',
                    tag.a(_('View Tickets'), href=req.href.query()))
