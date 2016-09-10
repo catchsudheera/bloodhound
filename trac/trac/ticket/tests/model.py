@@ -30,9 +30,10 @@ from trac.ticket.model import (
 )
 from trac.ticket.roadmap import MilestoneModule
 from trac.ticket.api import (
-    IMilestoneChangeListener, ITicketChangeListener, TicketSystem,
+    IMilestoneChangeListener, ITicketChangeListener, TicketSystem
 )
 from trac.util.datefmt import datetime_now, from_utimestamp, to_utimestamp, utc
+
 
 class TestTicketChangeListener(core.Component):
     implements(ITicketChangeListener)
@@ -1242,6 +1243,7 @@ class MilestoneTestCase(unittest.TestCase):
         self.assertFalse(milestone.exists)
         self.assertEqual('deleted', listener.action)
         self.assertEqual(milestone, listener.milestone)
+
 
 class ComponentTestCase(unittest.TestCase):
 

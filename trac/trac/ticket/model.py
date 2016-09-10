@@ -24,9 +24,8 @@ import re
 from trac.attachment import Attachment
 from trac import core
 from trac.cache import cached
-from trac.core import TracError, implements
-from trac.resource import (Resource, ResourceNotFound, IResourceChangeListener,
-                           ResourceSystem)
+from trac.core import TracError
+from trac.resource import Resource, ResourceNotFound, ResourceSystem
 from trac.ticket.api import TicketSystem
 from trac.util import embedded_numbers, partition
 from trac.util.text import empty
@@ -253,6 +252,8 @@ class Ticket(object):
         self.resource = self.resource(id=tkt_id)
         self._old = {}
 
+        for listener in TicketSystem(self.env).change_listeners:
+            listener.ticket_created(self)
         ResourceSystem(self.env).resource_created(self)
 
         return self.id
@@ -365,6 +366,8 @@ class Ticket(object):
         self._old = {}
         self.values['changetime'] = when
 
+        for listener in TicketSystem(self.env).change_listeners:
+            listener.ticket_changed(self, comment, author, old_values)
         context = dict(comment=comment, author=author)
         ResourceSystem(self.env).resource_changed(self, old_values, context)
 
@@ -439,6 +442,8 @@ class Ticket(object):
             db("DELETE FROM ticket_change WHERE ticket=%s", (self.id,))
             db("DELETE FROM ticket_custom WHERE ticket=%s", (self.id,))
 
+        for listener in TicketSystem(self.env).change_listeners:
+            listener.ticket_deleted(self)
         ResourceSystem(self.env).resource_deleted(self)
 
     def get_change(self, cnum=None, cdate=None, db=None):
@@ -1059,6 +1064,8 @@ class Milestone(object):
             del self.cache.milestones
             TicketSystem(self.env).reset_ticket_fields()
 
+        for listener in TicketSystem(self.env).milestone_change_listeners:
+            listener.milestone_deleted(self)
         ResourceSystem(self.env).resource_deleted(self)
 
     def insert(self, db=None):
@@ -1080,6 +1087,8 @@ class Milestone(object):
             self.checkin()
             TicketSystem(self.env).reset_ticket_fields()
 
+        for listener in TicketSystem(self.env).milestone_change_listeners:
+            listener.milestone_created(self)
         ResourceSystem(self.env).resource_created(self)
 
     def update(self, db=None, author=None):
@@ -1114,6 +1123,8 @@ class Milestone(object):
 
         old_values = dict((k, v) for k, v in old.iteritems()
                           if getattr(self, k) != v)
+        for listener in TicketSystem(self.env).milestone_change_listeners:
+            listener.milestone_changed(self, old_values)
         ResourceSystem(self.env).resource_changed(self, old_values)
 
     def move_tickets(self, new_milestone, author, comment=None,
@@ -1286,59 +1297,3 @@ class Version(object):
         def version_order(v):
             return (v.time or utcmax, embedded_numbers(v.name))
         return sorted(versions, key=version_order, reverse=True)
-
-class ResourceToMilestoneChangeListenerAdapter(core.Component):
-    """
-    The class provides backward compatibility for components implementing
-    IMilestoneChangeListener interface.
-    """
-    implements(IResourceChangeListener)
-
-    def match_resource(self, resource):
-        return isinstance(resource, Milestone)
-
-    def resource_created(self, resource, context):
-        for listener in TicketSystem(self.env).milestone_change_listeners:
-            listener.milestone_created(resource)
-
-    def resource_changed(self, resource, old_values, context):
-        for listener in TicketSystem(self.env).milestone_change_listeners:
-            listener.milestone_changed(resource, old_values)
-
-    def resource_deleted(self, resource, context):
-        for listener in TicketSystem(self.env).milestone_change_listeners:
-            listener.milestone_deleted(resource)
-
-    def resource_version_deleted(self, resource, context):
-        pass
-
-class ResourceToTicketChangeListenerAdapter(core.Component):
-    """
-    The class provides backward compatibility for components implementing
-    ITicketChangeListener interface.
-    """
-    implements(IResourceChangeListener)
-    def match_resource(self, resource):
-        return isinstance(resource, Ticket)
-
-    def resource_created(self, resource, context):
-        for listener in TicketSystem(self.env).change_listeners:
-            listener.ticket_created(resource)
-
-    def resource_changed(self, resource, old_values, context):
-        author = None
-        comment = None
-        if context:
-            comment = context.get("comment")
-            author = context.get("author")
-
-        for listener in TicketSystem(self.env).change_listeners:
-            listener.ticket_changed(resource, comment, author, old_values)
-
-    def resource_deleted(self, resource, context):
-        for listener in TicketSystem(self.env).change_listeners:
-            listener.ticket_deleted(resource)
-
-    def resource_version_deleted(self, resource, context):
-        pass
-
