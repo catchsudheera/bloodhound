@@ -326,7 +326,7 @@ class WikiResourceChangeListenerTestCase(unittest.TestCase):
     def test_change_listener_created(self):
         self._create_wiki_page(self.INITIAL_NAME)
         self.assertEqual('created', self.listener.action)
-        self.assertIsInstance(self.listener.resource, WikiPage)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
         self.assertEqual(self.INITIAL_NAME, self.wiki_name)
         self.assertEqual(self.INITIAL_TEXT, self.wiki_text)
 
@@ -336,7 +336,7 @@ class WikiResourceChangeListenerTestCase(unittest.TestCase):
         wiki_page.text = CHANGED_TEXT
         wiki_page.save("author1", "renamed_comment", "::2")
         self.assertEqual('changed', self.listener.action)
-        self.assertIsInstance(self.listener.resource, WikiPage)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
         self.assertEqual(self.INITIAL_NAME, self.wiki_name)
         self.assertEqual(CHANGED_TEXT, self.wiki_text)
         self.assertEqual({"text":self.INITIAL_TEXT}, self.listener.old_values)
@@ -346,7 +346,7 @@ class WikiResourceChangeListenerTestCase(unittest.TestCase):
         CHANGED_NAME = "NewWikiName"
         wiki_page.rename(CHANGED_NAME)
         self.assertEqual('changed', self.listener.action)
-        self.assertIsInstance(self.listener.resource, WikiPage)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
         self.assertEqual(CHANGED_NAME, self.wiki_name)
         self.assertEqual(self.INITIAL_TEXT, self.wiki_text)
         self.assertEqual({"name":self.INITIAL_NAME}, self.listener.old_values)
@@ -355,7 +355,7 @@ class WikiResourceChangeListenerTestCase(unittest.TestCase):
         wiki_page = self._create_wiki_page(self.INITIAL_NAME)
         wiki_page.delete()
         self.assertEqual('deleted', self.listener.action)
-        self.assertIsInstance(self.listener.resource, WikiPage)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
         self.assertEqual(self.INITIAL_NAME, self.wiki_name)
 
     def _create_wiki_page(self, name=None):
