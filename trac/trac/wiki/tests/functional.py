@@ -118,6 +118,11 @@ class TestWikiHistory(FunctionalTwillTestCaseSetup):
         tc.find(r'<a href="/wiki/%(name)s">%(name)s</a>' % {'name': pagename})
 
 
+class TestWikiHistory(FunctionalTwillTestCaseSetup):
+    def runTest(self):
+        """Create and edit a wiki page, and then check the page history."""
+        pass
+
 class TestWikiRename(FunctionalTwillTestCaseSetup):
     def runTest(self):
         """Test for simple wiki rename"""
