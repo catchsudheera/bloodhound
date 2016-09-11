@@ -67,3 +67,4 @@ class RevisionLinks(Component):
             pass
         return tag.a(label, class_="missing changeset", rel="nofollow",
                      href=formatter.href.changeset(rev))
+

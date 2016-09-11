@@ -244,6 +244,7 @@ class PostgreSQLConnection(ConnectionWrapper):
 
     def cursor(self):
         return IterableCursor(self.cnx.cursor(), self.log)
+
     def cast(self, column, type):
         # Temporary hack needed for the union of selects in the search module
         return 'CAST(%s AS %s)' % (column, _type_map.get(type, type))
