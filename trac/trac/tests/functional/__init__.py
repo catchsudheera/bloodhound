@@ -132,6 +132,8 @@ if twill:
                                   % twill.__version__)
             super(FunctionalTestSuite, self).__init__()
 
+        tester_class = FunctionalTester
+
         def setUp(self, port=None):
             """If no port is specified, use a semi-random port and subdirectory
             'testenv'; but if a port is specified, use that port and
