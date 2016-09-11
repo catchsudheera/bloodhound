@@ -1126,4 +1126,3 @@ class AttachmentAdmin(Component):
             finally:
                 if destination is not None:
                     output.close()
-

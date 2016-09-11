@@ -107,6 +107,5 @@ class SvnFunctionalTestEnvironment(FunctionalTestEnvironment):
             args = e.args + (output, )
             raise Exception(*args)
         return int(revision)
-
     def call_in_workdir(self, args, environ=None):
         return self.call_in_dir(self.work_dir(), args, environ)

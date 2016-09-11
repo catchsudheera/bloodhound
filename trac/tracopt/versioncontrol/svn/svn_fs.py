@@ -1143,7 +1143,6 @@ def DiffChangeEditor():
 
     return DiffChangeEditor()
 
-
 class FileContentStream(object):
 
     KEYWORD_GROUPS = {

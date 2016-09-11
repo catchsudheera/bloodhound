@@ -97,7 +97,7 @@ class IExternalResourceConnector(Interface):
         """
 
     def manager_exists(neighborhood):
-        """Check whether the component manager identified by 
+        """Check whether the component manager identified by
         the given `neighborhood` exists physically.
 
         :param neighborhood: manager identifier (i.e. `Neighborhood`)
@@ -109,7 +109,7 @@ class IExternalResourceConnector(Interface):
 
 
 class Neighborhood(object):
-    """Neighborhoods are the topmost level in the resources hierarchy. 
+    """Neighborhoods are the topmost level in the resources hierarchy.
     They represent resources managed by a component manager, thereby
     identifying the later. As such, resource neighborhoods serve to
     the purpose of specifying absolute references to resources hosted beyond
@@ -302,7 +302,7 @@ class Resource(object):
         if self.neighborhood is None:
             return '<Resource %r>' % (', '.join(path))
         else:
-            return '<Resource %r in Neighborhood %s:%s>' % (', '.join(path), 
+            return '<Resource %r in Neighborhood %s:%s>' % (', '.join(path),
                                                     self.neighborhood._realm,
                                                     self.neighborhood._id)
 
@@ -532,11 +532,11 @@ class ResourceSystem(Component):
             if default is not None:
                 return default
             else:
-                raise ResourceNotFound('Unexpected neighborhood %s' % 
+                raise ResourceNotFound('Unexpected neighborhood %s' %
                                        (neighborhood,))
         c = self.get_resource_connector(neighborhood._realm)
         if c is None:
-            raise ResourceNotFound('Missing connector for neighborhood %s' % 
+            raise ResourceNotFound('Missing connector for neighborhood %s' %
                                    (neighborhood,))
         return c.load_manager(neighborhood)
 
