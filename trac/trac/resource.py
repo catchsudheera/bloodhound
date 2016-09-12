@@ -518,7 +518,7 @@ class ResourceSystem(Component):
         """Return a list of all the realm names of neighborhoods."""
         realms = []
         for connector in self.resource_connectors:
-            for realm in manager.get_supported_neighborhoods() or []:
+            for realm in connector.get_supported_neighborhoods() or []:
                 realms.append(realm)
         return realms
 
@@ -540,32 +540,10 @@ class ResourceSystem(Component):
                                    (neighborhood,))
         return c.load_manager(neighborhood)
 
-    # FIXME: Generic ComponentCls.for_neighborhood (like C# extension methods?)
-    @classmethod
-    def for_neighborhood(cls, compmgr, neighborhood, componentclass=None):
-        """Instantiate a fiven component class in the context specified by
-        target neighborhood.
-        
-        :param compmgr: Source component manager.
-        :param neighborhood: Target neighborhood
-        :param componentclass: A subclass of `trac.core.Component`.
-        :throws ResourceNotFound: if there is no connector for neighborhood
-        
-        Note: This is a class method . The class used to invoke 
-        this method will be instantiated by default if `componentclass`
-        is set to `None`. 
-        """
-        assert componentclass is None or (issubclass(componentclass, Component)\
-                                          and not issubclass(componentclass, 
-                                                             ComponentManager))
-        rsys = ResourceSystem(compmgr)
-        target = rsys.load_component_manager(neighborhood, compmgr)
-        return rsys if target is compmgr else (componentclass or cls)(target)
-
     def neighborhood_prefix(self, neighborhood):
         return '' if neighborhood is None \
                   else '[%s:%s] ' % (neighborhood._realm,
-                                     neighborhood._id or '')
+                                     neighborhood._id or '') 
 
     # -- Utilities to trigger resources event notifications
 
@@ -588,6 +566,19 @@ class ResourceSystem(Component):
         for listener in self.change_listeners:
             if listener.match_resource(resource):
                 listener.resource_version_deleted(resource, context)
+
+
+def manager_for_neighborhood(compmgr, neighborhood):
+    """Instantiate a given component manager identified by
+    target neighborhood.
+    
+    :param compmgr: Source component manager.
+    :param neighborhood: Target neighborhood
+    :throws ResourceNotFound: if there is no connector for neighborhood
+    """
+    rsys = ResourceSystem(compmgr)
+    return rsys.load_component_manager(neighborhood, compmgr)
+
 
 # -- Utilities for manipulating resources in a generic way
 
@@ -626,7 +617,8 @@ def get_resource_url(env, resource, href, **kwargs):
 
     """
     try:
-        rsys = ResourceSystem.for_neighborhood(env, resource.neighborhood)
+        rsys = ResourceSystem(manager_for_neighborhood(env,
+                                                       resource.neighborhood))
     except ResourceNotFound:
         pass
     else:
@@ -670,14 +662,15 @@ def get_resource_description(env, resource, format='default', **kwargs):
 
     """
     try:
-        rsys = ResourceSystem.for_neighborhood(env, resource.neighborhood)
+        rsys = ResourceSystem(manager_for_neighborhood(env,
+                                                       resource.neighborhood))
     except ResourceNotFound:
-        pass
+        rsys = ResourceSystem(env)
     else:
         manager = rsys.get_resource_manager(resource.realm)
         if manager and hasattr(manager, 'get_resource_description'):
             return manager.get_resource_description(resource, format, **kwargs)
-    nbhprefix = rsys.neighborhood_prefix(resource.neighborhood)
+    nbhprefix = rsys.neighborhood_prefix(resource.neighborhood) 
 
     name = u'%s%s:%s' % (nbhprefix, resource.realm, resource.id)
     if format == 'summary':
@@ -798,7 +791,7 @@ def resource_exists(env, resource):
         False
     """
     try:
-        rsys = ResourceSystem.for_neighborhood(env, resource.neighborhood)
+        ResourceSystem(manager_for_neighborhood(env, resource.neighborhood))
     except ResourceNotFound:
         return False
     manager = ResourceSystem(env).get_resource_manager(resource.realm)

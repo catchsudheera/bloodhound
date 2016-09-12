@@ -16,12 +16,27 @@ from datetime import datetime, timedelta
 from trac.perm import PermissionCache, PermissionSystem
 from trac.resource import Resource
 from trac.test import EnvironmentStub, Mock
-from trac.ticket.api import TicketSystem
+from trac.core import implements, Component
+from trac.ticket.api import TicketSystem, ITicketFieldProvider
 from trac.ticket.model import Milestone, Ticket, Version
 from trac.util.datefmt import datetime_now, utc
 
 import unittest
 
+class TestFieldProvider(Component):
+    implements(ITicketFieldProvider)
+
+    def __init__(self):
+        self.raw_fields = []
+
+    def get_select_fields(self):
+        return []
+
+    def get_radio_fields(self):
+        return []
+
+    def get_raw_fields(self):
+        return self.raw_fields
 
 class TicketSystemTestCase(unittest.TestCase):
 
@@ -258,6 +273,40 @@ class TicketSystemTestCase(unittest.TestCase):
         self.assertFalse(self.ticket_system.resource_exists(r3))
         self.assertFalse(self.ticket_system.resource_exists(r4))
 
+    def test_can_add_raw_fields_from_field_providers(self):
+        testFieldProvider = self.env[TestFieldProvider]
+        self.assertIsNotNone(testFieldProvider)
+        testFieldProvider.raw_fields = [
+            {
+                'name': "test_name",
+                'type': 'some_type',
+                'label': "some_label",
+            },
+        ]
+        fields = TicketSystem(self.env).get_ticket_fields()
+        row_added_fields = [
+            field for field in fields if field["name"] == "test_name"]
+        self.assertEqual(1, len(row_added_fields))
+
+    def test_does_not_add_duplicated_raw_fields_from_field_providers(self):
+        testFieldProvider = self.env[TestFieldProvider]
+        self.assertIsNotNone(testFieldProvider)
+        testFieldProvider.raw_fields = [
+            {
+                'name': "test_name",
+                'type': 'some_type1',
+                'label': "some_label1",
+            },
+            {
+                'name': "test_name",
+                'type': 'some_type2',
+                'label': "some_label2",
+            },
+        ]
+        fields = TicketSystem(self.env).get_ticket_fields()
+        row_added_fields = [
+            field for field in fields if field["name"] == "test_name"]
+        self.assertEqual(1, len(row_added_fields))
 
 def suite():
     return unittest.makeSuite(TicketSystemTestCase)

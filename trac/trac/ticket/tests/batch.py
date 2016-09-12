@@ -32,7 +32,7 @@ class BatchModifyTestCase(unittest.TestCase):
         self.env = EnvironmentStub(default_data=True,
             enable=[default_workflow.ConfigurableTicketWorkflow,
                     DefaultPermissionPolicy, DefaultPermissionStore,
-                    web_ui.TicketModule,
+                    web_ui.TicketModule, 
                     api.TicketSystem])
         self.env.config.set('trac', 'permission_policies',
                             'DefaultPermissionPolicy')

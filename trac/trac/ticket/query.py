@@ -40,7 +40,6 @@ from trac.util.datefmt import datetime_now, format_datetime, from_utimestamp, \
 from trac.util.presentation import Paginator
 from trac.util.text import empty, shorten_line, quote_query_string
 from trac.util.translation import _, tag_, cleandoc_, ngettext
-from trac.util.introspection import get_enabled_component_subclass
 from trac.web import arg_list_to_args, parse_arg_list, IRequestHandler
 from trac.web.href import Href
 from trac.web.chrome import (INavigationContributor, Chrome,
@@ -904,7 +903,7 @@ class QueryModule(Component):
     def get_navigation_items(self, req):
         from trac.ticket.report import ReportModule
         if 'TICKET_VIEW' in req.perm and \
-                (get_enabled_component_subclass(self.env, ReportModule) is None or
+                (not self.env.is_component_enabled(ReportModule) or
                  'REPORT_VIEW' not in req.perm):
             yield ('mainnav', 'tickets',
                    tag.a(_('View Tickets'), href=req.href.query()))
@@ -916,9 +915,6 @@ class QueryModule(Component):
 
     def process_request(self, req):
         req.perm.assert_permission('TICKET_VIEW')
-        report_id = req.args.getfirst('report')
-        if report_id:
-            req.perm('report', report_id).assert_permission('REPORT_VIEW')
 
         constraints = self._get_constraints(req)
         args = req.args
@@ -973,14 +969,9 @@ class QueryModule(Component):
         max = args.get('max')
         if max is None and format in ('csv', 'tab'):
             max = 0 # unlimited unless specified explicitly
-        order = args.get('order')
-        if isinstance(order, (list, tuple)):
-            order = order[0] if order else None
-        group = args.get('group')
-        if isinstance(group, (list, tuple)):
-            group = group[0] if group else None
-        query = Query(self.env, report_id,
-                      constraints, cols, order, 'desc' in args, group,
+        query = Query(self.env, req.args.get('report'),
+                      constraints, cols, args.get('order'),
+                      'desc' in args, args.get('group'),
                       'groupdesc' in args, 'verbose' in args,
                       rows,
                       args.get('page'),
@@ -1384,16 +1375,10 @@ class TicketQueryMacro(WikiMacroBase):
 
         if format == 'count':
             cnt = query.count(req)
-            title = ngettext("%(num)d ticket for which %(query)s",
-                             "%(num)d tickets for which %(query)s",
-                             cnt, query=query_string)
-            return tag.span(cnt, title=title, class_='query_count')
+            return tag.span(cnt, title='%d tickets for which %s' %
+                            (cnt, query_string), class_='query_count')
 
-        try:
-            tickets = query.execute(req)
-        except QueryValueError, e:
-            self.log.warn(e)
-            return system_message(_("Error executing TicketQuery macro"), e)
+        tickets = query.execute(req)
 
         if format == 'table':
             data = query.template_data(formatter.context, tickets,
@@ -1413,21 +1398,14 @@ class TicketQueryMacro(WikiMacroBase):
             add_stylesheet(req, 'common/css/roadmap.css')
 
             def query_href(extra_args, group_value = None):
-                q = query_string + ''.join('&%s=%s' % (kw, v)
-                                           for kw in extra_args
-                                           if kw not in ['group', 'status']
-                                           for v in extra_args[kw])
-                q = Query.from_string(self.env, q)
-                args = {}
+                q = Query.from_string(self.env, query_string)
                 if q.group:
-                    args[q.group] = group_value
-                q.group = extra_args.get('group')
-                if 'status' in extra_args:
-                    args['status'] = extra_args['status']
+                    extra_args[q.group] = group_value
+                    q.group = None
                 for constraint in q.constraints:
-                    constraint.update(args)
+                    constraint.update(extra_args)
                 if not q.constraints:
-                    q.constraints.append(args)
+                    q.constraints.append(extra_args)
                 return q.get_href(formatter.context)
             chrome = Chrome(self.env)
             tickets = apply_ticket_permissions(self.env, req, tickets)

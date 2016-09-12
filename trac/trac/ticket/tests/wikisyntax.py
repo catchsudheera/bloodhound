@@ -318,7 +318,7 @@ query:summary=résumé
 <a class="query" href="/query?group=owner&amp;order=priority">query:group=owner</a>
 </p>
 <p>
-<a class="query" href="/query?order=priority&amp;row=description">query:verbose=1</a>
+<a class="query" href="/query?row=description&amp;order=priority">query:verbose=1</a>
 </p>
 <p>
 <a class="query" href="/query?summary=r%C3%A9sum%C3%A9&amp;order=priority">query:summary=résumé</a>
@@ -558,3 +558,4 @@ def suite():
 
 if __name__ == '__main__':
     unittest.main(defaultTest='suite')
+
