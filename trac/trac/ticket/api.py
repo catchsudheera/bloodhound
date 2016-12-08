@@ -166,10 +166,79 @@ class IMilestoneChangeListener(Interface):
     def milestone_deleted(milestone):
         """Called when a milestone is deleted."""
 
+class ITicketFieldProvider(Interface):
+    """Extension point interface for components that provide fields for the
+    ticket system."""
+
+    def get_select_fields():
+        """Returns a list of select fields, each as a tuple of
+        (rank, field)
+        where field is a dictionary that defines:
+            * name: the field name
+            * pk: the primary key of the field table
+            * label: the label to display, preferably wrapped with N_()
+            * cls: the model describing the field
+        the following keys can also usefully be defined:
+            * optional: a boolean specifying that the select can be empty
+
+        The rank is expected to be an integer to specify the sorting of the
+        select and radio fields. This is not intended to allow for the extent
+        of configurability of the custom fields but allows a plugin to mix in
+        fields as if they are a first class member of the ticket system.
+        """
+
+    def get_radio_fields():
+        """Returns a list of radio fields, each as a tuple of
+        (rank, field)
+        See the documentation for get_select_fields for descriptions of rank and
+        field.
+        Note that in contrast to get_select_fields, radio fields will all be
+        specified as optional.
+        """
+
+class TicketFields(Component):
+    implements(ITicketFieldProvider)
+
+    def get_select_fields(self):
+        """Default select and radio fields"""
+        from trac.ticket import model
+        selects = [(10, {'name': 'type', 'label': N_('Type'),
+                         'cls': model.Type}),
+                   (30, {'name':'priority', 'label': N_('Priority'),
+                         'cls': model.Priority}),
+                   (40, {'name': 'milestone', 'label': N_('Milestone'),
+                         'cls': model.Milestone, 'optional': True}),
+                   (50, {'name': 'component', 'label': N_('Component'),
+                         'cls': model.Component}),
+                   (60, {'name': 'version', 'label': N_('Version'),
+                         'cls': model.Version, 'optional': True}),
+                   (70, {'name': 'severity', 'label': N_('Severity'),
+                         'cls': model.Severity})]
+        return selects
+
+    def get_radio_fields(self):
+        """Default radio fields"""
+        from trac.ticket import model
+        radios = [(20, {'name': 'status', 'label': N_('Status'),
+                        'cls': model.Status}),
+                  (80, {'name': 'resolution', 'label': N_('Resolution'),
+                        'cls': model.Resolution})]
+        return radios
+
+    def get_raw_fields(self):
+        """Returns a list of fields, each represents ticket field
+        dictionary. For example:
+            * name: field name
+            * type: field type
+            * label: the label to display, preferably wrapped with N_()
+            * format: field format
+            * other appropriate field properties
+        """
 
 class TicketSystem(Component):
     implements(IPermissionRequestor, IWikiSyntaxProvider, IResourceManager)
 
+    ticket_field_providers = ExtensionPoint(ITicketFieldProvider)
     change_listeners = ExtensionPoint(ITicketChangeListener)
     milestone_change_listeners = ExtensionPoint(IMilestoneChangeListener)
 
@@ -308,28 +377,31 @@ class TicketSystem(Component):
                        'label': N_('Description')})
 
         # Default select and radio fields
-        selects = [('type', N_('Type'), model.Type),
-                   ('status', N_('Status'), model.Status),
-                   ('priority', N_('Priority'), model.Priority),
-                   ('milestone', N_('Milestone'), model.Milestone),
-                   ('component', N_('Component'), model.Component),
-                   ('version', N_('Version'), model.Version),
-                   ('severity', N_('Severity'), model.Severity),
-                   ('resolution', N_('Resolution'), model.Resolution)]
-        for name, label, cls in selects:
-            options = [val.name for val in cls.select(self.env, db=db)]
+        selects = []
+        [selects.extend(field_provider.get_select_fields())
+                    for field_provider in self.ticket_field_providers]
+        [select.update({'type': 'select'}) for n, select in selects]
+        radios = []
+        [radios.extend(field_provider.get_radio_fields())
+                    for field_provider in self.ticket_field_providers]
+        [radio.update({'type': 'radio',
+                       'optional': True}) for n, radio in radios]
+
+        selects.extend(radios)
+        selects.sort()
+        for rank, field in selects:
+            cls = field['cls']
+            name = field['name']
+            pk_field = field.get('pk', 'name')
+            options = [getattr(val, pk_field)
+                       for val in cls.select(self.env, db=db)]
             if not options:
                 # Fields without possible values are treated as if they didn't
                 # exist
                 continue
-            field = {'name': name, 'type': 'select', 'label': label,
-                     'value': getattr(self, 'default_' + name, ''),
-                     'options': options}
-            if name in ('status', 'resolution'):
-                field['type'] = 'radio'
-                field['optional'] = True
-            elif name in ('milestone', 'version'):
-                field['optional'] = True
+            if 'value' not in field:
+                field['value'] = getattr(self, 'default_' + name, '')
+            field['options'] = options
             fields.append(field)
 
         # Advanced text fields
@@ -360,11 +432,30 @@ class TicketSystem(Component):
             field['custom'] = True
             fields.append(field)
 
+        self._add_raw_fields_from_field_providers(fields)
+
         return fields
 
     reserved_field_names = ['report', 'order', 'desc', 'group', 'groupdesc',
                             'col', 'row', 'format', 'max', 'page', 'verbose',
                             'comment', 'or']
+
+    def _add_raw_fields_from_field_providers(self, fields):
+        for field_provider in self.ticket_field_providers:
+            if hasattr(field_provider, 'get_raw_fields'):
+                raw_fields = field_provider.get_raw_fields()
+                if raw_fields:
+                    for raw_field in raw_fields:
+                        self._add_raw_field(
+                            raw_field, fields)
+
+    def _add_raw_field(self, raw_field, fields):
+        if raw_field["name"] in [f['name'] for f in fields]:
+            self.log.warning(
+                'Duplicate field name "%s" (ignoring)', raw_field["name"])
+        else:
+            fields.append(raw_field)
+
 
     def get_custom_fields(self):
         return copy.deepcopy(self.custom_fields)
