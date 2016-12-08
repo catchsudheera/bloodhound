@@ -23,6 +23,7 @@ from trac.attachment import Attachment
 from trac.core import *
 from trac.resource import Resource
 from trac.test import EnvironmentStub
+from trac.tests.resource import TestResourceChangeListener
 from trac.util.datefmt import utc, to_utimestamp
 from trac.wiki import WikiPage, IWikiChangeListener
 
@@ -306,9 +307,76 @@ class WikiPageTestCase(unittest.TestCase):
         page = WikiPage(self.env, resource)
         self.assertEqual(1, page.version)
 
+class WikiResourceChangeListenerTestCase(unittest.TestCase):
+    INITIAL_NAME = "Wiki page 1"
+    INITIAL_TEXT = "some text"
+    INITIAL_AUTHOR = "anAuthor"
+    INITIAL_COMMENT = "some comment"
+    INITIAL_REMOTE_ADDRESS = "::1"
+
+    def setUp(self):
+        self.env = EnvironmentStub(default_data=True)
+        self.listener = TestResourceChangeListener(self.env)
+        self.listener.resource_type = WikiPage
+        self.listener.callback = self.listener_callback
+
+    def tearDown(self):
+        self.env.reset_db()
+
+    def test_change_listener_created(self):
+        self._create_wiki_page(self.INITIAL_NAME)
+        self.assertEqual('created', self.listener.action)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
+        self.assertEqual(self.INITIAL_NAME, self.wiki_name)
+        self.assertEqual(self.INITIAL_TEXT, self.wiki_text)
+
+    def test_change_listener_text_changed(self):
+        wiki_page = self._create_wiki_page(self.INITIAL_NAME)
+        CHANGED_TEXT = "some other text"
+        wiki_page.text = CHANGED_TEXT
+        wiki_page.save("author1", "renamed_comment", "::2")
+        self.assertEqual('changed', self.listener.action)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
+        self.assertEqual(self.INITIAL_NAME, self.wiki_name)
+        self.assertEqual(CHANGED_TEXT, self.wiki_text)
+        self.assertEqual({"text":self.INITIAL_TEXT}, self.listener.old_values)
+
+    def test_change_listener_renamed(self):
+        wiki_page = self._create_wiki_page(self.INITIAL_NAME)
+        CHANGED_NAME = "NewWikiName"
+        wiki_page.rename(CHANGED_NAME)
+        self.assertEqual('changed', self.listener.action)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
+        self.assertEqual(CHANGED_NAME, self.wiki_name)
+        self.assertEqual(self.INITIAL_TEXT, self.wiki_text)
+        self.assertEqual({"name":self.INITIAL_NAME}, self.listener.old_values)
+
+    def test_change_listener_deleted(self):
+        wiki_page = self._create_wiki_page(self.INITIAL_NAME)
+        wiki_page.delete()
+        self.assertEqual('deleted', self.listener.action)
+        self.assertTrue(isinstance(self.listener.resource, WikiPage))
+        self.assertEqual(self.INITIAL_NAME, self.wiki_name)
+
+    def _create_wiki_page(self, name=None):
+        name = name or self.INITIAL_NAME
+        wiki_page = WikiPage(self.env, name)
+        wiki_page.text = self.INITIAL_TEXT
+        wiki_page.save(
+            self.INITIAL_AUTHOR,
+            self.INITIAL_COMMENT,
+            self.INITIAL_REMOTE_ADDRESS)
+        return wiki_page
+
+    def listener_callback(self, action, resource, context, old_values = None):
+        self.wiki_name = resource.name
+        self.wiki_text = resource.text
 
 def suite():
-    return unittest.makeSuite(WikiPageTestCase)
+    suite = unittest.TestSuite()
+    suite.addTest(unittest.makeSuite(WikiPageTestCase))
+    suite.addTest(unittest.makeSuite(WikiResourceChangeListenerTestCase))
+    return suite
 
 if __name__ == '__main__':
     unittest.main(defaultTest='suite')
