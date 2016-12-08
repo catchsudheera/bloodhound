@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2006-2009 Edgewall Software
+# Copyright (C) 2006-2013 Edgewall Software
 # All rights reserved.
 #
 # This software is licensed as described in the file COPYING, which
@@ -11,24 +11,33 @@
 # individuals. For the exact contribution history, see the revision
 # history and logs, available at http://trac.edgewall.org/log/.
 
+from __future__ import absolute_import
+
 import os
 import unittest
+from pkg_resources import parse_version
 
 from genshi.core import Stream, TEXT
 from genshi.input import HTMLParser
 
 try:
-    pygments = __import__('pygments', {}, {}, [])
+    import pygments
     have_pygments = True
 except ImportError:
     have_pygments = False
 
-from trac.mimeview.api import Mimeview, RenderingContext
+import trac.tests.compat
+from trac.mimeview.api import Mimeview
 if have_pygments:
     from trac.mimeview.pygments import PygmentsRenderer
 from trac.test import EnvironmentStub, Mock
+from trac.util import get_pkginfo
 from trac.web.chrome import Chrome, web_context
 from trac.web.href import Href
+
+
+if have_pygments:
+    pygments_version = parse_version(get_pkginfo(pygments).get('version'))
 
 
 class PygmentsRendererTestCase(unittest.TestCase):
@@ -56,8 +65,8 @@ class PygmentsRendererTestCase(unittest.TestCase):
         #print "\nR: " + repr(result)
         expected, result = expected.splitlines(), result.splitlines()
         for exp, res in zip(expected, result):
-            self.assertEquals(exp, res)
-        self.assertEquals(len(expected), len(result))
+            self.assertEqual(exp, res)
+        self.assertEqual(len(expected), len(result))
 
     def test_python_hello(self):
         """
@@ -68,7 +77,10 @@ def hello():
         return "Hello World!"
 """)
         self.assertTrue(result)
-        self._test('python_hello', result)
+        if pygments_version < parse_version('2.1'):
+            self._test('python_hello', result)
+        else:
+            self._test('python_hello_pygments_2.1plus', result)
 
     def test_python_hello_mimeview(self):
         """
@@ -79,7 +91,10 @@ def hello():
         return "Hello World!"
 """)
         self.assertTrue(result)
-        self._test('python_hello_mimeview', result)
+        if pygments_version < parse_version('2.1'):
+            self._test('python_hello_mimeview', result)
+        else:
+            self._test('python_hello_mimeview_pygments_2.1plus', result)
 
     def test_newline_content(self):
         """
@@ -108,7 +123,7 @@ def hello():
         pygments when rendering empty files.
         """
         result = self.pygments.render(self.context, 'text/x-python', '')
-        self.assertEqual(None, result)
+        self.assertIsNone(result)
 
     def test_extra_mimetypes(self):
         """
@@ -116,17 +131,19 @@ def hello():
         Pygments supports it.
         """
         mimeview = Mimeview(self.env)
-        self.assertEqual('text/x-ini; charset=utf-8',
-                         mimeview.get_mimetype('file.ini'))
-        self.assertEqual('text/x-ini; charset=utf-8',
-                         mimeview.get_mimetype('file.cfg'))
+        self.assertIn(mimeview.get_mimetype('file.ini'),
+                      ('text/x-ini; charset=utf-8',
+                       'text/inf; charset=utf-8'))  # Pygment 2.1+
+        self.assertIn(mimeview.get_mimetype('file.cfg'),
+                      ('text/x-ini; charset=utf-8',
+                       'text/inf; charset=utf-8'))  # Pygment 2.1+
         self.assertEqual('text/x-ini; charset=utf-8',
                          mimeview.get_mimetype('file.text/x-ini'))
 
 def suite():
     suite = unittest.TestSuite()
     if have_pygments:
-        suite.addTest(unittest.makeSuite(PygmentsRendererTestCase, 'test'))
+        suite.addTest(unittest.makeSuite(PygmentsRendererTestCase))
     else:
         print 'SKIP: mimeview/tests/pygments (no pygments installed)'
     return suite

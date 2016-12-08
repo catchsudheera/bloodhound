@@ -18,17 +18,18 @@
 
 from __future__ import with_statement
 
-from datetime import datetime
-
 from trac.core import *
-from trac.resource import Resource, ResourceSystem
-from trac.util.datefmt import from_utimestamp, to_utimestamp, utc
+from trac.resource import Resource
+from trac.util.datefmt import datetime_now, from_utimestamp, to_utimestamp, utc
 from trac.util.translation import _
 from trac.wiki.api import WikiSystem, validate_page_name
 
 
 class WikiPage(object):
-    """Represents a wiki page (new or existing)."""
+    """Represents a wiki page (new or existing).
+
+    :since 1.0.3: the `ipnr` is deprecated and will be removed in 1.3.1
+    """
 
     realm = 'wiki'
 
@@ -39,7 +40,7 @@ class WikiPage(object):
             name = self.resource.id
         else:
             if version:
-                version = int(version) # must be a number or None
+                version = int(version)  # must be a number or None
             self.resource = Resource('wiki', name, version)
         self.name = name
         if name:
@@ -84,7 +85,8 @@ class WikiPage(object):
         :since 1.0: the `db` parameter is no longer needed and will be removed
         in version 1.1.1
         """
-        assert self.exists, "Cannot delete non-existent page"
+        if not self.exists:
+            raise TracError(_("Cannot delete non-existent page"))
 
         with self.env.db_transaction as db:
             if version is None:
@@ -112,18 +114,18 @@ class WikiPage(object):
         if not self.exists:
             for listener in WikiSystem(self.env).change_listeners:
                 listener.wiki_page_deleted(self)
-            ResourceSystem(self.env).resource_deleted(self)
         else:
             for listener in WikiSystem(self.env).change_listeners:
                 if hasattr(listener, 'wiki_page_version_deleted'):
                     listener.wiki_page_version_deleted(self)
-            ResourceSystem(self.env).resource_version_deleted(self)
 
-    def save(self, author, comment, remote_addr, t=None, db=None):
+    def save(self, author, comment, remote_addr=None, t=None, db=None):
         """Save a new version of a page.
 
         :since 1.0: the `db` parameter is no longer needed and will be removed
-        in version 1.1.1
+                    in version 1.1.1
+        :since 1.0.3: `remote_addr` is optional and deprecated, and will be
+                      removed in 1.3.1
         """
         if not validate_page_name(self.name):
             raise TracError(_("Invalid Wiki page name '%(name)s'",
@@ -132,7 +134,7 @@ class WikiPage(object):
         new_text = self.text != self.old_text
         if not new_text and self.readonly == self.old_readonly:
             raise TracError(_("Page not modified"))
-        t = t or datetime.now(utc)
+        t = t or datetime_now(utc)
 
         with self.env.db_transaction as db:
             if new_text:
@@ -159,26 +161,13 @@ class WikiPage(object):
             if self.version == 1:
                 listener.wiki_page_added(self)
             else:
-                listener.wiki_page_changed(self, self.version, t, comment,
-                                           author, remote_addr)
-        context=dict(
-            version=self.version,
-            time=t,
-            comment=comment,
-            author=author,
-            remote_addr=remote_addr)
-        if self.version == 1:
-            ResourceSystem(self.env).resource_created(self, context)
-        else:
-            old_values = dict()
-            if self.readonly != self.old_readonly:
-                old_values["readonly"] = self.old_readonly
-            if self.text != self.old_text:
-                old_values["text"] = self.old_text
-            ResourceSystem(self.env).resource_changed(
-                self,
-                old_values,
-                context)
+                from trac.util import arity
+                if arity(listener.wiki_page_changed) == 6:
+                    listener.wiki_page_changed(self, self.version, t,
+                                               comment, author, remote_addr)
+                else:
+                    listener.wiki_page_changed(self, self.version, t,
+                                               comment, author)
 
         self.old_readonly = self.readonly
         self.old_text = self.text
@@ -186,9 +175,10 @@ class WikiPage(object):
     def rename(self, new_name):
         """Rename wiki page in-place, keeping the history intact.
         Renaming a page this way will eventually leave dangling references
-        to the old page - which litterally doesn't exist anymore.
+        to the old page - which literally doesn't exist anymore.
         """
-        assert self.exists, "Cannot rename non-existent page"
+        if not self.exists:
+            raise TracError(_("Cannot rename non-existent page"))
 
         if not validate_page_name(new_name):
             raise TracError(_("Invalid Wiki page name '%(name)s'",
@@ -209,23 +199,21 @@ class WikiPage(object):
             Attachment.reparent_all(self.env, 'wiki', old_name, 'wiki',
                                     new_name)
 
-        self.name = new_name
-        self.env.log.info('Renamed page %s to %s', old_name, new_name)
+        self.name = self.resource.id = new_name
+        self.env.log.info("Renamed page %s to %s", old_name, new_name)
 
         for listener in WikiSystem(self.env).change_listeners:
             if hasattr(listener, 'wiki_page_renamed'):
                 listener.wiki_page_renamed(self, old_name)
 
-        ResourceSystem(self.env).resource_changed(
-            self,
-            dict(name=old_name)
-        )
-
     def get_history(self, db=None):
         """Retrieve the edit history of a wiki page.
 
+        :returns: a tuple containing the `version`, `datetime`, `author`,
+                  `comment` and `ipnr`.
         :since 1.0: the `db` parameter is no longer needed and will be removed
-        in version 1.1.1
+                    in version 1.1.1
+        :since 1.0.3: use of `ipnr` is deprecated and will be removed in 1.3.1
         """
         for version, ts, author, comment, ipnr in self.env.db_query("""
                 SELECT version, time, author, comment, ipnr FROM wiki

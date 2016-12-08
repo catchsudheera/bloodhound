@@ -288,7 +288,8 @@
       switch (property.type) {
         case 'select':
           focusElement = createSelect(inputName, property.options, true,
-                                      property.optgroups)
+                                      property.optgroups);
+          focusElement.attr("id", inputName);
           td.append(focusElement);
           break;
         case 'radio':
@@ -316,12 +317,13 @@
           if ($.inArray(propertyName, batch_list_properties) >= 0) {
             focusElement = appendBatchListControls(td, inputName);
           } else {
-            focusElement = createText(inputName, 42);
+            focusElement = createText(inputName, 42).attr("id", inputName);
             td.append(focusElement);
           }
           break;
         case 'time':
-          focusElement = createText(inputName, 42).addClass("time");
+          focusElement = createText(inputName, 42).addClass("time")
+                                                  .attr("id", inputName);
           td.append(focusElement);
           break;
       }
@@ -329,11 +331,14 @@
     }
 
     function appendBatchListControls(td, inputName) {
-      var modeSelect = createSelect(inputName + "_mode", batch_list_modes);
-      var text1 = createText(inputName, 42);
-      var text2 = createText(inputName + "_secondary", 42);
+      var modeSelect = createSelect(inputName + "_mode", batch_list_modes)
+                       .attr("id", inputName);
+      var text1 = createText(inputName + "_primary", 42)
+                             .attr("id", inputName + "_primary");
+      var text2 = createText(inputName + "_secondary", 42)
+                             .attr("id", inputName + "_secondary");
       var label1 = createLabel(" " + batch_list_modes[0]['name'] + ":",
-                               inputName);
+                               inputName + "_primary");
       var label2 = createLabel(_(" remove:"), inputName + "_secondary");
       td.append(modeSelect);
       td.append(label1);
@@ -380,13 +385,15 @@
 
     // Add a checkbox at the top of the column
     // to select every ticket in the group.
-    $("table.listing tr th.id").each(function() {
-      $(this).before(
-        $('<th class="batchmod_selector sel">').append(
-          $('<input type="checkbox" name="batchmod_toggleGroup" />').attr({
-            title: _("Toggle selection of all tickets shown in this group")
-          })));
-    });
+    if ($("table.listing tr td.id").length) {
+        $("table.listing tr th.id").each(function() {
+          $(this).before(
+            $('<th class="batchmod_selector sel">').append(
+              $('<input type="checkbox" name="batchmod_toggleGroup" />').attr({
+                title: _("Toggle selection of all tickets shown in this group")
+              })));
+        });
+    }
 
     // Add the click behavior for the group toggle.
     $("input[name='batchmod_toggleGroup']").click(function() {
@@ -443,6 +450,13 @@
         }
       });
 
+      // Remove handler and class that prevent multi-submit
+      if (!valid) {
+        var form = $(this);
+        form.removeClass("trac-submit-is-disabled");
+        form.unbind("submit.prevent-submit");
+      }
+
       return valid;
     });
 
@@ -479,7 +493,8 @@
 
       // Add the header row.
       tr.append($('<th scope="row">')
-        .append(createLabel(property.label, getBatchInputName(propertyName)))
+        .append(createLabel(property.label + ":",  // FIXME: french l10n
+                            getBatchInputName(propertyName)))
       );
 
       // Add the input element.

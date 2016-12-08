@@ -1,11 +1,22 @@
 # -*- coding: utf-8 -*-
+#
+# Copyright (C) 2006-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
 
-from datetime import datetime
 import unittest
 
-from trac.util.datefmt import utc
+from trac.util.datefmt import datetime_now, utc
 from trac.wiki.model import WikiPage
 from trac.wiki.tests import formatter
+
 
 TEST_CASES = u"""
 ============================== wiki: link resolver
@@ -646,9 +657,35 @@ MissingFirstLevel/MissingPage
 """ # "
 
 
+SAFE_INTERWIKI_TESTS = u"""
+============================== InterWiki with safe_schemes
+This is the original MeatBall:InterMapTxt wiki page.
+
+Checkout the [tsvn:http://svn.edgewall.com/repos/trac Trac Repository].
+
+complex link complex:a:test with positional arguments.
+
+js:"alert(1)" javasc:"ript:alert(1)"
+------------------------------
+<p>
+This is the original <a class="ext-link" href="http://www.usemod.com/cgi-bin/mb.pl?InterMapTxt" title="InterMapTxt in MeatBall..."><span class="icon"></span>MeatBall:InterMapTxt</a> wiki page.
+</p>
+<p>
+Checkout the <a class="ext-link" href="tsvn:http://svn.edgewall.com/repos/trac" title="http://svn.edgewall.com/repos/trac in tsvn"><span class="icon"></span>Trac Repository</a>.
+</p>
+<p>
+complex link <a class="ext-link" href="http://server/a/page/test?format=txt" title="resource test in a"><span class="icon"></span>complex:a:test</a> with positional arguments.
+</p>
+<p>
+js:&#34;alert(1)&#34; javasc:&#34;ript:alert(1)&#34;
+</p>
+------------------------------
+""" # "
+
+
 def wiki_setup(tc):
     tc.env.config.set('wiki', 'render_unsafe_content', True) # for #9712
-    now = datetime.now(utc)
+    now = datetime_now(utc)
     wiki0 = WikiPage(tc.env)
     wiki0.name = 'Main/Sub'
     wiki0.text = '--'
@@ -675,10 +712,12 @@ def wiki_setup(tc):
 This is the InterMapTxt
 ----
 {{{
-MeatBall 	http://www.usemod.com/cgi-bin/mb.pl? # $1 in MeatBall...
+MeatBall        http://www.usemod.com/cgi-bin/mb.pl? # $1 in MeatBall...
 tsvn            tsvn:
 complex         http://server/$1/page/$2?format=txt  # resource $2 in $1
-over        http://unused/? # Overridden in trac.ini
+over            http://unused/? # Overridden in trac.ini
+js              javascript:
+javasc          javasc
 }}}
 ----
 {{{
@@ -711,6 +750,8 @@ nolink          http://noweb
     w.text = '--'
     w.save('joe', 'other third level of hierarchy', '::1', now)
 
+    tc.env.db_transaction("INSERT INTO ticket (id) VALUES ('123')")
+
 
 def wiki_teardown(tc):
     tc.env.reset_db()
@@ -719,6 +760,13 @@ def wiki_teardown(tc):
 def wiki_setup_split(tc):
     tc.env.config.set('wiki', 'split_page_names', 'true')
     wiki_setup(tc)
+
+
+def wiki_setup_safe_interwiki(tc):
+    wiki_setup(tc)
+    tc.env.config.set('wiki', 'render_unsafe_content', 'false')
+    tc.env.config.set('wiki', 'safe_schemes',
+                      'file,ftp,git,irc,http,https,ssh,svn,tsvn')
 
 
 def suite():
@@ -735,6 +783,9 @@ def suite():
                                   wiki_teardown,
                                   context=('wiki',
                                       'FirstLevel/SecondLevel/ThirdLevel')))
+    suite.addTest(formatter.suite(SAFE_INTERWIKI_TESTS,
+                                  wiki_setup_safe_interwiki, __file__,
+                                  wiki_teardown))
     return suite
 
 if __name__ == '__main__':

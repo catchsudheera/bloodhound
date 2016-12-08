@@ -27,8 +27,11 @@ import pkg_resources
 from pprint import pformat, pprint
 import re
 import sys
+import traceback
+import StringIO
+from urlparse import urlparse
 
-from genshi.builder import Fragment, tag
+from genshi.builder import tag
 from genshi.output import DocType
 from genshi.template import TemplateLoader
 
@@ -41,14 +44,18 @@ from trac.loader import get_plugin_info, match_plugins_to_frames
 from trac.perm import PermissionCache, PermissionError
 from trac.resource import ResourceNotFound
 from trac.util import arity, get_frame_info, get_last_traceback, hex_entropy, \
-                      read_file, safe_repr, translation
+                      read_file, safe_repr, translation, warn_setuptools_issue
 from trac.util.concurrency import threading
 from trac.util.datefmt import format_datetime, localtz, timezone, user_time
-from trac.util.text import exception_to_unicode, shorten_line, to_unicode
+from trac.util.text import exception_to_unicode, shorten_line, to_unicode, \
+                           to_utf8, unicode_quote
 from trac.util.translation import _, get_negotiated_locale, has_babel, \
                                   safefmt, tag_
-from trac.web.api import *
-from trac.web.chrome import Chrome
+from trac.web.api import HTTPBadRequest, HTTPException, HTTPForbidden, \
+                         HTTPInternalError, HTTPNotFound, IAuthenticator, \
+                         IRequestFilter, IRequestHandler, Request, \
+                         RequestDone, TracNotImplementedError
+from trac.web.chrome import Chrome, add_notice, add_warning
 from trac.web.href import Href
 from trac.web.session import Session
 
@@ -64,11 +71,27 @@ class FakeSession(dict):
         pass
 
 
-class FakePerm(dict):
-    def require(self, *args):
-        return False
-    def __call__(self, *args):
+class FakePerm(object):
+
+    username = 'anonymous'
+
+    def __call__(self, realm_or_resource, id=False, version=False):
         return self
+
+    def has_permission(self, action, realm_or_resource=None, id=False,
+                       version=False):
+        return False
+
+    __contains__ = has_permission
+
+    def require(self, action, realm_or_resource=None, id=False, version=False,
+                message=None):
+        if message is None:
+            raise PermissionError(action)
+        else:
+            raise PermissionError(msg=message)
+
+    assert_permission = require
 
 
 class RequestWithSession(Request):
@@ -128,15 +151,26 @@ class RequestDispatcher(Component):
         like Apache with `mod_xsendfile` or lighttpd. (''since 1.0'')
         """)
 
+    xsendfile_header = Option('trac', 'xsendfile_header', 'X-Sendfile',
+        """The header to use if `use_xsendfile` is enabled. If Nginx is used,
+        set `X-Accel-Redirect`. (''since 1.0.6'')""")
+
     # Public API
 
     def authenticate(self, req):
         for authenticator in self.authenticators:
-            authname = authenticator.authenticate(req)
+            try:
+                authname = authenticator.authenticate(req)
+            except TracError, e:
+                self.log.error("Can't authenticate using %s: %s",
+                               authenticator.__class__.__name__,
+                               exception_to_unicode(e, traceback=True))
+                add_warning(req, _("Authentication error. "
+                                   "Please contact your administrator."))
+                break  # don't fallback to other authenticators
             if authname:
                 return authname
-        else:
-            return 'anonymous'
+        return 'anonymous'
 
     def dispatch(self, req):
         """Find a registered handler that matches the request and let
@@ -152,13 +186,14 @@ class RequestDispatcher(Component):
         req.callbacks.update({
             'authname': self.authenticate,
             'chrome': chrome.prepare_request,
+            'form_token': self._get_form_token,
+            'lc_time': self._get_lc_time,
+            'locale': self._get_locale,
             'perm': self._get_perm,
             'session': self._get_session,
-            'locale': self._get_locale,
-            'lc_time': self._get_lc_time,
             'tz': self._get_timezone,
-            'form_token': self._get_form_token,
             'use_xsendfile': self._get_use_xsendfile,
+            'xsendfile_header': self._get_xsendfile_header,
         })
 
         try:
@@ -175,14 +210,14 @@ class RequestDispatcher(Component):
                             chosen_handler = self.default_handler
                     # pre-process any incoming request, whether a handler
                     # was found or not
-                    chosen_handler = self._pre_process_request(req,
-                                                            chosen_handler)
+                    chosen_handler = \
+                        self._pre_process_request(req, chosen_handler)
                 except TracError, e:
                     raise HTTPInternalError(e)
                 if not chosen_handler:
                     if req.path_info.endswith('/'):
                         # Strip trailing / and redirect
-                        target = req.path_info.rstrip('/').encode('utf-8')
+                        target = unicode_quote(req.path_info.rstrip('/'))
                         if req.query_string:
                             target += '?' + req.query_string
                         req.redirect(req.href + target, permanent=True)
@@ -225,12 +260,13 @@ class RequestDispatcher(Component):
                     if 'hdfdump' in req.args:
                         req.perm.require('TRAC_ADMIN')
                         # debugging helper - no need to render first
-                        out = StringIO()
+                        out = StringIO.StringIO()
                         pprint(data, out)
                         req.send(out.getvalue(), 'text/plain')
 
-                    output = chrome.render_template(req, template, data,
-                                                    content_type)
+                    output = chrome.render_template(
+                            req, template, data, content_type,
+                            iterable=chrome.use_chunked_encoding)
                     req.send(output, content_type or 'text/html')
                 else:
                     self._post_process_request(req)
@@ -249,9 +285,15 @@ class RequestDispatcher(Component):
                                    exception_to_unicode(e, traceback=True))
                 raise err[0], err[1], err[2]
         except PermissionError, e:
-            raise HTTPForbidden(to_unicode(e))
+            raise HTTPForbidden(e)
         except ResourceNotFound, e:
             raise HTTPNotFound(e)
+        except NotImplementedError, e:
+            tb = traceback.extract_tb(err[2])[-1]
+            self.log.warning("%s caught from %s:%d in %s: %s",
+                             e.__class__.__name__, tb[0], tb[1], tb[2],
+                             to_unicode(e) or "(no message)")
+            raise HTTPInternalError(TracNotImplementedError(e))
         except TracError, e:
             raise HTTPInternalError(e)
 
@@ -261,7 +303,7 @@ class RequestDispatcher(Component):
         if isinstance(req.session, FakeSession):
             return FakePerm()
         else:
-            return PermissionCache(self.env, self.authenticate(req))
+            return PermissionCache(self.env, req.authname)
 
     def _get_session(self, req):
         try:
@@ -277,7 +319,8 @@ class RequestDispatcher(Component):
             default = self.env.config.get('trac', 'default_language', '')
             negotiated = get_negotiated_locale([preferred, default] +
                                                req.languages)
-            self.log.debug("Negotiated locale: %s -> %s", preferred, negotiated)
+            self.log.debug("Negotiated locale: %s -> %s", preferred,
+                           negotiated)
             return negotiated
 
     def _get_lc_time(self, req):
@@ -306,7 +349,7 @@ class RequestDispatcher(Component):
         If the the user does not have a `trac_form_token` cookie a new
         one is generated.
         """
-        if req.incookie.has_key('trac_form_token'):
+        if 'trac_form_token' in req.incookie:
             return req.incookie['trac_form_token'].value
         else:
             req.outcookie['trac_form_token'] = hex_entropy(24)
@@ -319,6 +362,21 @@ class RequestDispatcher(Component):
 
     def _get_use_xsendfile(self, req):
         return self.use_xsendfile
+
+    # RFC7230 3.2 Header Fields
+    _xsendfile_header_re = re.compile(r"[-0-9A-Za-z!#$%&'*+.^_`|~]+\Z")
+    _warn_xsendfile_header = False
+
+    def _get_xsendfile_header(self, req):
+        header = self.xsendfile_header.strip()
+        if self._xsendfile_header_re.match(header):
+            return to_utf8(header)
+        else:
+            if not self._warn_xsendfile_header:
+                self._warn_xsendfile_header = True
+                self.log.warn("[trac] xsendfile_header is invalid: '%s'",
+                              header)
+            return None
 
     def _pre_process_request(self, req, chosen_handler):
         for filter_ in self.filters:
@@ -340,8 +398,9 @@ class RequestDispatcher(Component):
                 f.post_process_request(req, *(None,)*extra_arg_count)
         return resp
 
-_slashes_re = re.compile(r'/+')
 
+_warn_setuptools = False
+_slashes_re = re.compile(r'/+')
 
 def dispatch_request(environ, start_response):
     """Main entry point for the Trac web interface.
@@ -349,6 +408,11 @@ def dispatch_request(environ, start_response):
     :param environ: the WSGI environment dict
     :param start_response: the WSGI callback for starting the response
     """
+
+    global _warn_setuptools
+    if _warn_setuptools is False:
+        _warn_setuptools = True
+        warn_setuptools_issue(out=environ.get('wsgi.errors'))
 
     # SCRIPT_URL is an Apache var containing the URL before URL rewriting
     # has been applied, so we can use it to reconstruct logical SCRIPT_NAME
@@ -376,70 +440,91 @@ def dispatch_request(environ, start_response):
     environ.setdefault('trac.locale', '')
     environ.setdefault('trac.base_url',
                        os.getenv('TRAC_BASE_URL'))
-    environ.setdefault('trac.bootstrap_handler',
-                       os.getenv('TRAC_BOOTSTRAP_HANDLER'))
+
 
     locale.setlocale(locale.LC_ALL, environ['trac.locale'])
 
-    # Load handler for environment lookup and instantiation of request objects
-    from trac.hooks import load_bootstrap_handler
-    bootstrap_ep = environ['trac.bootstrap_handler']
-    bootstrap = load_bootstrap_handler(bootstrap_ep, environ.get('wsgi.errors'))
-
     # Determine the environment
-    
-    env = env_error = None
-    try:
-        env = bootstrap.open_environment(environ, start_response)
-    except RequestDone:
-        return []
-    except EnvironmentError, e:
-        if e.__class__ is EnvironmentError:
-            raise
-        else:
-            env_error = e
-    except Exception, e:
-        env_error = e
-    else:
-        try:
-            if env.base_url_for_redirect:
-                environ['trac.base_url'] = env.base_url
-    
-            # Web front-end type and version information
-            if not hasattr(env, 'webfrontend'):
-                mod_wsgi_version = environ.get('mod_wsgi.version')
-                if mod_wsgi_version:
-                    mod_wsgi_version = (
-                            "%s (WSGIProcessGroup %s WSGIApplicationGroup %s)" %
-                            ('.'.join([str(x) for x in mod_wsgi_version]),
-                             environ.get('mod_wsgi.process_group'),
-                             environ.get('mod_wsgi.application_group') or
-                             '%{GLOBAL}'))
-                    environ.update({
-                        'trac.web.frontend': 'mod_wsgi',
-                        'trac.web.version': mod_wsgi_version})
-                env.webfrontend = environ.get('trac.web.frontend')
-                if env.webfrontend:
-                    env.systeminfo.append((env.webfrontend,
-                                           environ['trac.web.version']))
-        except Exception, e:
-            env_error = e
+    env_path = environ.get('trac.env_path')
+    if not env_path:
+        env_parent_dir = environ.get('trac.env_parent_dir')
+        env_paths = environ.get('trac.env_paths')
+        if env_parent_dir or env_paths:
+            # The first component of the path is the base name of the
+            # environment
+            path_info = environ.get('PATH_INFO', '').lstrip('/').split('/')
+            env_name = path_info.pop(0)
 
+            if not env_name:
+                # No specific environment requested, so render an environment
+                # index page
+                send_project_index(environ, start_response, env_parent_dir,
+                                   env_paths)
+                return []
+
+            errmsg = None
+
+            # To make the matching patterns of request handlers work, we append
+            # the environment name to the `SCRIPT_NAME` variable, and keep only
+            # the remaining path in the `PATH_INFO` variable.
+            script_name = environ.get('SCRIPT_NAME', '')
+            try:
+                script_name = unicode(script_name, 'utf-8')
+                # (as Href expects unicode parameters)
+                environ['SCRIPT_NAME'] = Href(script_name)(env_name)
+                environ['PATH_INFO'] = '/' + '/'.join(path_info)
+
+                if env_parent_dir:
+                    env_path = os.path.join(env_parent_dir, env_name)
+                else:
+                    env_path = get_environments(environ).get(env_name)
+
+                if not env_path or not os.path.isdir(env_path):
+                    errmsg = 'Environment not found'
+            except UnicodeDecodeError:
+                errmsg = 'Invalid URL encoding (was %r)' % script_name
+
+            if errmsg:
+                start_response('404 Not Found',
+                               [('Content-Type', 'text/plain'),
+                                ('Content-Length', str(len(errmsg)))])
+                return [errmsg]
+
+    if not env_path:
+        raise EnvironmentError('The environment options "TRAC_ENV" or '
+                               '"TRAC_ENV_PARENT_DIR" or the mod_python '
+                               'options "TracEnv" or "TracEnvParentDir" are '
+                               'missing. Trac requires one of these options '
+                               'to locate the Trac environment(s).')
     run_once = environ['wsgi.run_once']
 
-    req = None
-    if env_error is None:
-        try:
-            req = bootstrap.create_request(env, environ, start_response) \
-                if env is not None else Request(environ, start_response)
-        except Exception, e:
-            log = environ.get('wsgi.errors')
-            if log:
-                log.write("[FAIL] [Trac] Entry point '%s' "
-                          "Method 'create_request' Reason %s" %
-                          (bootstrap_ep, repr(exception_to_unicode(e))))
-    if req is None:
-        req = RequestWithSession(environ, start_response)
+    env = env_error = None
+    try:
+        env = open_environment(env_path, use_cache=not run_once)
+        if env.base_url_for_redirect:
+            environ['trac.base_url'] = env.base_url
+
+        # Web front-end type and version information
+        if not hasattr(env, 'webfrontend'):
+            mod_wsgi_version = environ.get('mod_wsgi.version')
+            if mod_wsgi_version:
+                mod_wsgi_version = (
+                        "%s (WSGIProcessGroup %s WSGIApplicationGroup %s)" %
+                        ('.'.join([str(x) for x in mod_wsgi_version]),
+                         environ.get('mod_wsgi.process_group'),
+                         environ.get('mod_wsgi.application_group') or
+                         '%{GLOBAL}'))
+                environ.update({
+                    'trac.web.frontend': 'mod_wsgi',
+                    'trac.web.version': mod_wsgi_version})
+            env.webfrontend = environ.get('trac.web.frontend')
+            if env.webfrontend:
+                env.systeminfo.append((env.webfrontend,
+                                       environ['trac.web.version']))
+    except Exception, e:
+        env_error = e
+
+    req = RequestWithSession(environ, start_response)
     translation.make_activable(lambda: req.locale, env.path if env else None)
     try:
         return _dispatch_request(req, env, env_error)
@@ -467,7 +552,7 @@ def _dispatch_request(req, env, env_error):
 
     # fixup env.abs_href if `[trac] base_url` was not specified
     if env and not env.abs_href.base:
-        env._abs_href = req.abs_href
+        env.abs_href = req.abs_href
 
     try:
         if not env and env_error:
@@ -475,12 +560,12 @@ def _dispatch_request(req, env, env_error):
         try:
             dispatcher = RequestDispatcher(env)
             dispatcher.dispatch(req)
-        except RequestDone:
-            pass
-        resp = req._response or []
+        except RequestDone, req_done:
+            resp = req_done.iterable
+        resp = resp or req._response or []
     except HTTPException, e:
         _send_user_error(req, env, e)
-    except Exception, e:
+    except Exception:
         send_internal_error(env, req, sys.exc_info())
     return resp
 
@@ -488,44 +573,24 @@ def _dispatch_request(req, env, env_error):
 def _send_user_error(req, env, e):
     # See trac/web/api.py for the definition of HTTPException subclasses.
     if env:
-        env.log.warn('[%s] %s' % (req.remote_addr, exception_to_unicode(e)))
-    try:
-        # We first try to get localized error messages here, but we
-        # should ignore secondary errors if the main error was also
-        # due to i18n issues
-        title = _('Error')
-        if e.reason:
-            if title.lower() in e.reason.lower():
-                title = e.reason
-            else:
-                title = _('Error: %(message)s', message=e.reason)
-    except Exception:
-        title = 'Error'
-    # The message is based on the e.detail, which can be an Exception
-    # object, but not a TracError one: when creating HTTPException,
-    # a TracError.message is directly assigned to e.detail
-    if isinstance(e.detail, Exception): # not a TracError
-        message = exception_to_unicode(e.detail)
-    elif isinstance(e.detail, Fragment): # markup coming from a TracError
-        message = e.detail
-    else:
-        message = to_unicode(e.detail)
-    data = {'title': title, 'type': 'TracError', 'message': message,
+        env.log.warn('[%s] %s', req.remote_addr, exception_to_unicode(e))
+    data = {'title': e.title, 'type': 'TracError', 'message': e.message,
             'frames': [], 'traceback': None}
     if e.code == 403 and req.authname == 'anonymous':
         # TRANSLATOR: ... not logged in, you may want to 'do so' now (link)
         do_so = tag.a(_("do so"), href=req.href.login())
-        req.chrome['notices'].append(
-            tag_("You are currently not logged in. You may want to "
-                 "%(do_so)s now.", do_so=do_so))
+        add_notice(req, tag_("You are currently not logged in. You may want "
+                             "to %(do_so)s now.", do_so=do_so))
     try:
         req.send_error(sys.exc_info(), status=e.code, env=env, data=data)
     except RequestDone:
         pass
 
+
 def send_internal_error(env, req, exc_info):
     if env:
-        env.log.error("Internal Server Error: %s",
+        env.log.error("Internal Server Error: %r, referrer %r%s",
+                      req, req.environ.get('HTTP_REFERER'),
                       exception_to_unicode(exc_info[1], traceback=True))
     message = exception_to_unicode(exc_info[1])
     traceback = get_last_traceback()
@@ -539,6 +604,7 @@ def send_internal_error(env, req, exc_info):
         pass
 
     tracker = default_tracker
+    tracker_args = {}
     if has_admin and not isinstance(exc_info[1], MemoryError):
         # Collect frame and plugin information
         frames = get_frame_info(exc_info[2])
@@ -554,17 +620,23 @@ def send_internal_error(env, req, exc_info):
             faulty_plugins.sort(key=lambda p: p['frame_idx'])
             if faulty_plugins:
                 info = faulty_plugins[0]['info']
+                home_page = info.get('home_page', '')
                 if 'trac' in info:
                     tracker = info['trac']
-                elif info.get('home_page', '').startswith(th):
+                elif urlparse(home_page)[1] == urlparse(th)[1]:
                     tracker = th
+                    plugin_name = info.get('home_page', '').rstrip('/') \
+                                                           .split('/')[-1]
+                    tracker_args = {'component': plugin_name}
 
     def get_description(_):
         if env and has_admin:
             sys_info = "".join("|| '''`%s`''' || `%s` ||\n"
                                % (k, v.replace('\n', '` [[br]] `'))
                                for k, v in env.get_systeminfo())
-            sys_info += "|| '''`jQuery`''' || `#JQUERY#` ||\n"
+            sys_info += "|| '''`jQuery`''' || `#JQUERY#` ||\n" \
+                        "|| '''`jQuery UI`''' || `#JQUERYUI#` ||\n" \
+                        "|| '''`jQuery Timepicker`''' || `#JQUERYTP#` ||\n"
             enabled_plugins = "".join("|| '''`%s`''' || `%s` ||\n"
                                       % (p['name'], p['version'] or _('N/A'))
                                       for p in plugins)
@@ -608,9 +680,10 @@ User agent: `#USER_AGENT#`
             'traceback': traceback, 'frames': frames,
             'shorten_line': shorten_line, 'repr': safe_repr,
             'plugins': plugins, 'faulty_plugins': faulty_plugins,
-            'tracker': tracker,
+            'tracker': tracker, 'tracker_args': tracker_args,
             'description': description, 'description_en': description_en}
 
+    Chrome(env).add_jquery_ui(req)
     try:
         req.send_error(exc_info, status=500, env=env, data=data)
     except RequestDone:
@@ -702,7 +775,7 @@ def get_environments(environ, warn=False):
         paths = [path[:-1] for path in paths if path[-1] == '/'
                  and not any(fnmatch.fnmatch(path[:-1], pattern)
                              for pattern in ignore_patterns)]
-        env_paths.extend(os.path.join(env_parent_dir, project) \
+        env_paths.extend(os.path.join(env_parent_dir, project)
                          for project in paths)
     envs = {}
     for env_path in env_paths:

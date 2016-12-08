@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2005-2009 Edgewall Software
+# Copyright (C) 2005-2013 Edgewall Software
 # Copyright (C) 2005 Christian Boos <cboos@bct-technology.com>
 # Copyright (C) 2005 Christopher Lenz <cmlenz@gmx.de>
 # All rights reserved.
@@ -79,7 +79,7 @@ class PHPRenderer(Component):
     def render(self, context, mimetype, content, filename=None, rev=None):
         # -n to ignore php.ini so we're using default colors
         cmdline = '%s -sn' % self.path
-        self.log.debug("PHP command line: %s" % cmdline)
+        self.log.debug("PHP command line: %s", cmdline)
 
         content = content_to_unicode(self.env, content, mimetype)
         content = content.encode('utf-8')

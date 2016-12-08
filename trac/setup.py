@@ -18,10 +18,10 @@ from setuptools import setup, find_packages
 
 min_python = (2, 5)
 if sys.version_info < min_python:
-    print "Trac requires Python %d.%d or later" % min_python
+    print("Trac requires Python %d.%d or later" % min_python)
     sys.exit(1)
 if sys.version_info >= (3,):
-    print "Trac doesn't support Python 3 (yet)"
+    print("Trac doesn't support Python 3 (yet)")
     sys.exit(1)
 
 extra = {}
@@ -49,13 +49,13 @@ except ImportError:
 try:
     import genshi
 except ImportError:
-    print "Genshi is needed by Trac setup, pre-installing"
+    print("Genshi is needed by Trac setup, pre-installing")
     # give some context to the warnings we might get when installing Genshi
 
 
 setup(
     name = 'Trac',
-    version = '1.0.1',
+    version = '1.0.13',
     description = 'Integrated SCM, wiki, issue tracker and project environment',
     long_description = """
 Trac is a minimalistic web-based software project management and bug/issue
@@ -66,8 +66,8 @@ facilities.
     author = 'Edgewall Software',
     author_email = 'trac-dev@googlegroups.com',
     license = 'BSD',
-    url = 'http://trac.edgewall.org/',
-    download_url = 'http://trac.edgewall.org/wiki/TracDownload',
+    url = 'https://trac.edgewall.org/',
+    download_url = 'https://trac.edgewall.org/wiki/TracDownload',
     classifiers = [
         'Environment :: Web Environment',
         'Framework :: Trac',
@@ -79,7 +79,7 @@ facilities.
         'Topic :: Software Development :: Version Control',
     ],
 
-    packages = find_packages(exclude=['*.tests']),
+    packages = find_packages(exclude=['*.tests', 'tests.*', '*.tests.*']),
     package_data = {
         '': ['templates/*'],
         'trac': ['htdocs/*.*', 'htdocs/README', 'htdocs/js/*.*',
@@ -87,8 +87,7 @@ facilities.
                  'htdocs/css/jquery-ui/*.*',
                  'htdocs/css/jquery-ui/images/*.*',
                  'htdocs/guide/*', 'locale/*/LC_MESSAGES/messages.mo',
-                 'locale/*/LC_MESSAGES/tracini.mo',
-                 'TRAC_VERSION'],
+                 'locale/*/LC_MESSAGES/tracini.mo'],
         'trac.wiki': ['default-pages/*'],
         'trac.ticket': ['workflows/*.ini'],
     },
@@ -104,11 +103,12 @@ facilities.
         'Genshi>=0.6',
     ],
     extras_require = {
-        'Babel': ['Babel>=0.9.5'],
-        'Pygments': ['Pygments>=0.6'],
-        'reST': ['docutils>=0.3'],
-        'SilverCity': ['SilverCity>=0.9.4'],
-        'Textile': ['textile>=2.0'],
+        'babel': ['Babel>=0.9.5'],
+        'configobj': ['configobj'],
+        'pygments': ['Pygments>=0.6'],
+        'rest': ['docutils>=0.3.9'],
+        'silvercity': ['SilverCity>=0.9.4'],
+        'textile': ['textile>=2.0'],
     },
 
     entry_points = """
@@ -125,9 +125,9 @@ facilities.
         trac.db.postgres = trac.db.postgres_backend
         trac.db.sqlite = trac.db.sqlite_backend
         trac.mimeview.patch = trac.mimeview.patch
-        trac.mimeview.pygments = trac.mimeview.pygments[Pygments]
-        trac.mimeview.rst = trac.mimeview.rst[reST]
-        trac.mimeview.txtl = trac.mimeview.txtl[Textile]
+        trac.mimeview.pygments = trac.mimeview.pygments[pygments]
+        trac.mimeview.rst = trac.mimeview.rst[rest]
+        trac.mimeview.txtl = trac.mimeview.txtl[textile]
         trac.prefs = trac.prefs.web_ui
         trac.search = trac.search.web_ui
         trac.ticket.admin = trac.ticket.admin
@@ -141,6 +141,7 @@ facilities.
         trac.versioncontrol.svn_authz = trac.versioncontrol.svn_authz
         trac.versioncontrol.web_ui = trac.versioncontrol.web_ui
         trac.web.auth = trac.web.auth
+        trac.web.main = trac.web.main
         trac.web.session = trac.web.session
         trac.wiki.admin = trac.wiki.admin
         trac.wiki.interwiki = trac.wiki.interwiki
@@ -149,8 +150,8 @@ facilities.
         trac.wiki.web_api = trac.wiki.web_api
         tracopt.mimeview.enscript = tracopt.mimeview.enscript
         tracopt.mimeview.php = tracopt.mimeview.php
-        tracopt.mimeview.silvercity = tracopt.mimeview.silvercity[SilverCity]
-        tracopt.perm.authz_policy = tracopt.perm.authz_policy
+        tracopt.mimeview.silvercity = tracopt.mimeview.silvercity[silvercity]
+        tracopt.perm.authz_policy = tracopt.perm.authz_policy[configobj]
         tracopt.perm.config_perm_provider = tracopt.perm.config_perm_provider
         tracopt.ticket.clone = tracopt.ticket.clone
         tracopt.ticket.commit_updater = tracopt.ticket.commit_updater

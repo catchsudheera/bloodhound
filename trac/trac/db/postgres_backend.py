@@ -22,7 +22,7 @@ from trac.core import *
 from trac.config import Option
 from trac.db.api import IDatabaseConnector, _parse_db_str
 from trac.db.util import ConnectionWrapper, IterableCursor
-from trac.util import get_pkginfo
+from trac.util import get_pkginfo, lazy
 from trac.util.compat import close_fds
 from trac.util.text import empty, exception_to_unicode, to_unicode
 from trac.util.translation import _
@@ -34,14 +34,13 @@ try:
     from psycopg2 import DataError, ProgrammingError
     from psycopg2.extensions import register_type, UNICODE, \
                                     register_adapter, AsIs, QuotedString
-
+except ImportError:
+    pass
+else:
+    has_psycopg = True
     register_type(UNICODE)
     register_adapter(Markup, lambda markup: QuotedString(unicode(markup)))
     register_adapter(type(empty), lambda empty: AsIs("''"))
-
-    has_psycopg = True
-except ImportError:
-    pass
 
 _like_escape_re = re.compile(r'([/_%])')
 
@@ -53,10 +52,19 @@ _type_map = {
 
 def assemble_pg_dsn(path, user=None, password=None, host=None, port=None):
     """Quote the parameters and assemble the DSN."""
+    def quote(value):
+        if not isinstance(value, basestring):
+            value = unicode(value)
+        return "'%s'" % value.replace('\\', r'\\').replace("'", r"\'")
 
     dsn = {'dbname': path, 'user': user, 'password': password, 'host': host,
            'port': port}
-    return ' '.join(["%s='%s'" % (k,v) for k,v in dsn.iteritems() if v])
+    return ' '.join("%s=%s" % (name, quote(value))
+                    for name, value in dsn.iteritems() if value)
+
+
+def _quote(identifier):
+    return '"%s"' % identifier.replace('"', '""')
 
 
 class PostgreSQLConnector(Component):
@@ -101,7 +109,7 @@ class PostgreSQLConnector(Component):
                                   params)
         cursor = cnx.cursor()
         if cnx.schema:
-            cursor.execute('CREATE SCHEMA "%s"' % cnx.schema)
+            cursor.execute('CREATE SCHEMA ' + _quote(cnx.schema))
             cursor.execute('SET search_path TO %s', (cnx.schema,))
         if schema is None:
             from trac.db_default import schema
@@ -111,7 +119,7 @@ class PostgreSQLConnector(Component):
         cnx.commit()
 
     def to_sql(self, table):
-        sql = ['CREATE TABLE "%s" (' % table.name]
+        sql = ['CREATE TABLE %s (' % _quote(table.name)]
         coldefs = []
         for column in table.columns:
             ctype = column.type
@@ -120,18 +128,20 @@ class PostgreSQLConnector(Component):
                 ctype = 'SERIAL'
             if len(table.key) == 1 and column.name in table.key:
                 ctype += ' PRIMARY KEY'
-            coldefs.append('    "%s" %s' % (column.name, ctype))
+            coldefs.append('    %s %s' % (_quote(column.name), ctype))
         if len(table.key) > 1:
-            coldefs.append('    CONSTRAINT "%s_pk" PRIMARY KEY ("%s")'
-                           % (table.name, '","'.join(table.key)))
+            coldefs.append('    CONSTRAINT %s PRIMARY KEY (%s)' %
+                           (_quote(table.name + '_pk'),
+                            ','.join(_quote(col) for col in table.key)))
         sql.append(',\n'.join(coldefs) + '\n)')
         yield '\n'.join(sql)
         for index in table.indices:
             unique = 'UNIQUE' if index.unique else ''
-            yield 'CREATE %s INDEX "%s_%s_idx" ON "%s" ("%s")' % \
-                    (unique, table.name,
-                     '_'.join(index.columns), table.name,
-                     '","'.join(index.columns))
+            yield 'CREATE %s INDEX %s ON %s (%s)' % \
+                  (unique,
+                   _quote('%s_%s_idx' % (table.name, '_'.join(index.columns))),
+                   _quote(table.name),
+                   ','.join(_quote(col) for col in index.columns))
 
     def alter_column_types(self, table, columns):
         """Yield SQL statements altering the type of one or more columns of
@@ -146,9 +156,10 @@ class PostgreSQLConnector(Component):
             if to != _type_map.get(from_, from_):
                 alterations.append((name, to))
         if alterations:
-            yield "ALTER TABLE %s %s" % (table,
-                ', '.join("ALTER COLUMN %s TYPE %s" % each
-                          for each in alterations))
+            yield 'ALTER TABLE %s %s' % \
+                  (_quote(table),
+                   ', '.join('ALTER COLUMN %s TYPE %s' % (_quote(name), type_)
+                             for name, type_ in alterations))
 
     def backup(self, dest_file):
         from subprocess import Popen, PIPE
@@ -231,12 +242,46 @@ class PostgreSQLConnection(ConnectionWrapper):
             cnx.rollback()
         ConnectionWrapper.__init__(self, cnx, log)
 
+    def cursor(self):
+        return IterableCursor(self.cnx.cursor(), self.log)
+
     def cast(self, column, type):
         # Temporary hack needed for the union of selects in the search module
         return 'CAST(%s AS %s)' % (column, _type_map.get(type, type))
 
     def concat(self, *args):
         return '||'.join(args)
+
+    def drop_table(self, table):
+        if (self._version or '').startswith(('8.0.', '8.1.')):
+            cursor = self.cursor()
+            cursor.execute("""SELECT table_name FROM information_schema.tables
+                              WHERE table_schema=current_schema()
+                              AND table_name=%s""", (table,))
+            for row in cursor:
+                if row[0] == table:
+                    self.execute("DROP TABLE " + self.quote(table))
+                    break
+        else:
+            self.execute("DROP TABLE IF EXISTS " + self.quote(table))
+
+    def get_column_names(self, table):
+        rows = self.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema=%s AND table_name=%s
+            """, (self.schema, table))
+        return [row[0] for row in rows]
+
+    def get_last_id(self, cursor, table, column='id'):
+        cursor.execute("SELECT CURRVAL(%s)",
+                       (self.quote(self._sequence_name(table, column)),))
+        return cursor.fetchone()[0]
+
+    def get_table_names(self):
+        rows = self.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema=%s""", (self.schema,))
+        return [row[0] for row in rows]
 
     def like(self):
         """Return a case-insensitive LIKE clause."""
@@ -245,19 +290,35 @@ class PostgreSQLConnection(ConnectionWrapper):
     def like_escape(self, text):
         return _like_escape_re.sub(r'/\1', text)
 
+    def ping(self):
+        cursor = self.cnx.cursor()
+        cursor.execute('SELECT 1')
+
+    def prefix_match(self):
+        """Return a case sensitive prefix-matching operator."""
+        return "LIKE %s ESCAPE '/'"
+
+    def prefix_match_value(self, prefix):
+        """Return a value for case sensitive prefix-matching operator."""
+        return self.like_escape(prefix) + '%'
+
     def quote(self, identifier):
         """Return the quoted identifier."""
-        return '"%s"' % identifier.replace('"', '""')
-
-    def get_last_id(self, cursor, table, column='id'):
-        cursor.execute("""SELECT CURRVAL('"%s_%s_seq"')""" % (table, column))
-        return cursor.fetchone()[0]
+        return _quote(identifier)
 
     def update_sequence(self, cursor, table, column='id'):
-        cursor.execute("""
-            SELECT setval('"%s_%s_seq"', (SELECT MAX(%s) FROM %s))
-            """ % (table, column, column, table))
+        cursor.execute("SELECT SETVAL(%%s, (SELECT MAX(%s) FROM %s))"
+                       % (self.quote(column), self.quote(table)),
+                       (self.quote(self._sequence_name(table, column)),))
 
-    def cursor(self):
-        return IterableCursor(self.cnx.cursor(), self.log)
+    def _sequence_name(self, table, column):
+        return '%s_%s_seq' % (table, column)
 
+    @lazy
+    def _version(self):
+        cursor = self.cursor()
+        cursor.execute('SELECT version()')
+        for version, in cursor:
+            # retrieve "8.1.23" from "PostgreSQL 8.1.23 on ...."
+            if version.startswith('PostgreSQL '):
+                return version.split(' ', 2)[1]

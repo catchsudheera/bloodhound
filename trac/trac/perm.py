@@ -20,49 +20,54 @@ from __future__ import with_statement
 
 import csv
 import os
-from time import time
 
 from trac.admin import AdminCommandError, IAdminCommandProvider, get_dir_list
 from trac.cache import cached
 from trac.config import ExtensionOption, OrderedExtensionsOption
 from trac.core import *
-from trac.resource import get_resource_name, manager_for_neighborhood, \
-                          Neighborhood, Resource
+from trac.resource import Resource, get_resource_name
 from trac.util import file_or_std
+from trac.util.datefmt import time_now
 from trac.util.text import path_to_unicode, print_table, printout, \
                            stream_encoding, to_unicode, wrap
-from trac.util.translation import _
+from trac.util.translation import _, N_
 
 __all__ = ['IPermissionRequestor', 'IPermissionStore', 'IPermissionPolicy',
            'IPermissionGroupProvider', 'PermissionError', 'PermissionSystem']
 
 
 class PermissionError(StandardError):
-    """Insufficient permissions to complete the operation"""
+    """Insufficient permissions to perform the operation.
 
-    def __init__ (self, action=None, resource=None, env=None, msg=None):
-        StandardError.__init__(self)
+    :since 1.0.5: the `msg` attribute is deprecated and will be removed in
+                  1.3.1. Use the `message` property instead.
+    """
+
+    title = N_("Forbidden")
+
+    def __init__(self, action=None, resource=None, env=None, msg=None):
         self.action = action
         self.resource = resource
         self.env = env
-        self.msg = msg
-
-    def __unicode__ (self):
         if self.action:
             if self.resource:
-                return _('%(perm)s privileges are required to perform '
-                         'this operation on %(resource)s. You don\'t have the '
-                         'required permissions.',
-                         perm=self.action,
-                         resource=get_resource_name(self.env, self.resource))
+                msg = _("%(perm)s privileges are required to perform "
+                        "this operation on %(resource)s. You don't have the "
+                        "required permissions.",
+                        perm=self.action,
+                        resource=get_resource_name(self.env, self.resource))
             else:
-                return _('%(perm)s privileges are required to perform this '
-                         'operation. You don\'t have the required '
-                         'permissions.', perm=self.action)
-        elif self.msg:
-            return self.msg
-        else:
-            return _('Insufficient privileges to perform this operation.')
+                msg = _("%(perm)s privileges are required to perform this "
+                        "operation. You don't have the required "
+                        "permissions.", perm=self.action)
+        elif msg is None:
+            msg = _("Insufficient privileges to perform this operation.")
+        self.msg = msg
+        super(PermissionError, self).__init__(msg)
+
+    @property
+    def message(self):
+        return self.args[0]
 
 
 class IPermissionRequestor(Interface):
@@ -277,17 +282,16 @@ class DefaultPermissionPolicy(Component):
 
     def __init__(self):
         self.permission_cache = {}
-        self.last_reap = time()
+        self.last_reap = time_now()
 
     # IPermissionPolicy methods
 
     def check_permission(self, action, username, resource, perm):
-        # TODO: Precondition resource.neighborhood is None
-        now = time()
+        now = time_now()
 
         if now - self.last_reap > self.CACHE_REAP_TIME:
             self.permission_cache = {}
-            self.last_reap = time()
+            self.last_reap = time_now()
 
         timestamp, permissions = self.permission_cache.get(username, (0, None))
 
@@ -334,7 +338,7 @@ class PermissionSystem(Component):
 
     def __init__(self):
         self.permission_cache = {}
-        self.last_reap = time()
+        self.last_reap = time_now()
 
     # Public API
 
@@ -413,7 +417,7 @@ class PermissionSystem(Component):
 
         Users are returned as a list of user names.
         """
-        now = time()
+        now = time_now()
         if now - self.last_reap > self.CACHE_REAP_TIME:
             self.permission_cache = {}
             self.last_reap = now
@@ -457,24 +461,13 @@ class PermissionSystem(Component):
         is allowed."""
         if username is None:
             username = 'anonymous'
-        if resource:
-            if resource.realm is None:
-                resource = None
-            elif resource.neighborhood is not None:
-                try:
-                    compmgr = manager_for_neighborhood(self.env, 
-                                                       resource.neighborhood)
-                except ResourceNotFound:
-                    #FIXME: raise ?
-                    return False
-                else:
-                    return PermissionSystem(compmgr).check_permission(
-                            action, username, resource, perm)
+        if resource and resource.realm is None:
+            resource = None
         for policy in self.policies:
             decision = policy.check_permission(action, username, resource,
                                                perm)
             if decision is not None:
-                if not decision:
+                if decision is False:
                     self.log.debug("%s denies %s performing %s on %r",
                                    policy.__class__.__name__, username,
                                    action, resource)
@@ -534,9 +527,6 @@ class PermissionCache(object):
 
     def __init__(self, env, username=None, resource=None, cache=None,
                  groups=None):
-        if resource and resource.neighborhood is not None:
-            env = manager_for_neighborhood(env, resource.neighborhood)
-            resource = Neighborhood(None, None).child(resource)
         self.env = env
         self.username = username or 'anonymous'
         self._resource = resource
@@ -579,26 +569,24 @@ class PermissionCache(object):
             if resource == cache_resource:
                 return cache_decision
         perm = self
-        permsys = PermissionSystem(self.env)
         if resource is not self._resource:
-            if resource.neighborhood is not None:
-                perm = PermissionCache(self.env, self.username, resource, {})
-                permsys = PermissionSystem(manager_for_neighborhood(
-                        self.env, resource.neighborhood))
-            else:
-                perm = PermissionCache(self.env, self.username, resource,
-                                       self._cache)
-        decision = permsys.check_permission(action, perm.username, resource,
-                                            perm)
+            perm = PermissionCache(self.env, self.username, resource,
+                                   self._cache)
+        decision = PermissionSystem(self.env). \
+                   check_permission(action, perm.username, resource, perm)
         self._cache[key] = (decision, resource)
         return decision
 
     __contains__ = has_permission
 
-    def require(self, action, realm_or_resource=None, id=False, version=False):
+    def require(self, action, realm_or_resource=None, id=False, version=False,
+                message=None):
         resource = self._normalize_resource(realm_or_resource, id, version)
         if not self._has_permission(action, resource):
-            raise PermissionError(action, resource, self.env)
+            if message is None:
+                raise PermissionError(action, resource, self.env)
+            else:
+                raise PermissionError(msg=message)
     assert_permission = require
 
     def permissions(self):
@@ -707,9 +695,17 @@ class PermissionAdmin(Component):
                     permsys.revoke_permission(u, a)
                     found = True
             if not found:
-                raise AdminCommandError(
-                    _("Cannot remove permission %(action)s for user %(user)s.",
-                      action=action, user=user))
+                if user in self.get_user_list() and \
+                        action in permsys.get_user_permissions(user):
+                    msg = _("Cannot remove permission %(action)s for user "
+                            "%(user)s. The permission is granted through "
+                            "a meta-permission or group.", action=action,
+                            user=user)
+                else:
+                    msg = _("Cannot remove permission %(action)s for user "
+                            "%(user)s. The user has not been granted the "
+                            "permission.", action=action, user=user)
+                raise AdminCommandError(msg)
 
     def _do_export(self, filename=None):
         try:

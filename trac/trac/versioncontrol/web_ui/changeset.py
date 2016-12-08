@@ -20,11 +20,11 @@
 
 from __future__ import with_statement
 
+from functools import partial
 from itertools import groupby
 import os
 import posixpath
 import re
-from StringIO import StringIO
 
 from genshi.builder import tag
 
@@ -39,12 +39,13 @@ from trac.util import as_bool, content_disposition, embedded_numbers, pathjoin
 from trac.util.datefmt import from_utimestamp, pretty_timedelta
 from trac.util.text import exception_to_unicode, to_unicode, \
                            unicode_urlencode, shorten_line, CRLF
-from trac.util.translation import _, ngettext
+from trac.util.translation import _, ngettext, tag_
 from trac.versioncontrol.api import RepositoryManager, Changeset, Node, \
                                     NoSuchChangeset
 from trac.versioncontrol.diff import get_diff_options, diff_blocks, \
                                      unified_diff
 from trac.versioncontrol.web_ui.browser import BrowserModule
+from trac.versioncontrol.web_ui.util import render_zip
 from trac.web import IRequestHandler, RequestDone
 from trac.web.chrome import (Chrome, INavigationContributor, add_ctxtnav,
                              add_link, add_script, add_stylesheet,
@@ -100,7 +101,7 @@ class DefaultPropertyDiffRenderer(Component):
         unidiff = '--- \n+++ \n' + \
                   '\n'.join(unified_diff(old.splitlines(), new.splitlines(),
                                          options.get('contextlines', 3)))
-        return tag.li('Property ', tag.strong(name),
+        return tag.li(tag_("Property %(name)s", name=tag.strong(name)),
                       Mimeview(self.env).render(old_context, 'text/x-diff',
                                                 unidiff))
 
@@ -213,9 +214,9 @@ class ChangesetModule(Component):
         req.perm.require('CHANGESET_VIEW')
 
         # -- retrieve arguments
-        full_new_path = new_path = req.args.get('new_path')
+        new_path = req.args.get('new_path')
         new = req.args.get('new')
-        full_old_path = old_path = req.args.get('old_path')
+        old_path = req.args.get('old_path')
         old = req.args.get('old')
         reponame = req.args.get('reponame')
 
@@ -252,14 +253,14 @@ class ChangesetModule(Component):
 
         # -- normalize and check for special case
         try:
-            new_path = repos.normalize_path(new_path)
             new = repos.normalize_rev(new)
-            full_new_path = '/' + pathjoin(repos.reponame, new_path)
-            old_path = repos.normalize_path(old_path or new_path)
             old = repos.normalize_rev(old or new)
-            full_old_path = '/' + pathjoin(repos.reponame, old_path)
         except NoSuchChangeset, e:
-            raise ResourceNotFound(e.message, _('Invalid Changeset Number'))
+            raise ResourceNotFound(e, _("Invalid Changeset Number"))
+        new_path = repos.normalize_path(new_path)
+        old_path = repos.normalize_path(old_path or new_path)
+        full_new_path = '/' + pathjoin(repos.reponame, new_path)
+        full_old_path = '/' + pathjoin(repos.reponame, old_path)
 
         if old_path == new_path and old == new: # revert to Changeset
             old_path = old = None
@@ -268,7 +269,7 @@ class ChangesetModule(Component):
         diff_opts = diff_data['options']
 
         # -- setup the `chgset` and `restricted` flags, see docstring above.
-        chgset = not old and not old_path
+        chgset = not old and old_path is None
         if chgset:
             restricted = new_path not in ('', '/') # (subset or not)
         else:
@@ -305,7 +306,7 @@ class ChangesetModule(Component):
                 new = repos.youngest_rev
             elif not old:
                 old = repos.youngest_rev
-            if not old_path:
+            if old_path is None:
                 old_path = new_path
             data = {'old_path': old_path, 'old_rev': old,
                     'new_path': new_path, 'new_rev': new}
@@ -339,15 +340,14 @@ class ChangesetModule(Component):
                 if restricted:
                     filename = 'diff-%s-from-%s-to-%s' \
                                   % (rpath, old, new)
-                elif old_path == '/': # special case for download (#238)
-                    filename = '%s-%s' % (rpath, old)
                 else:
                     filename = 'diff-from-%s-%s-to-%s-%s' \
                                % (old_path.replace('/','_'), old, rpath, new)
             if format == 'diff':
                 self._render_diff(req, filename, repos, data)
             elif format == 'zip':
-                self._render_zip(req, filename, repos, data)
+                render_zip(req, filename + '.zip', repos, None,
+                           partial(self._zip_iter_nodes, req, repos, data))
 
         # -- HTML format
         self._render_html(req, repos, chgset, restricted, xhr, data)
@@ -577,9 +577,10 @@ class ChangesetModule(Component):
             else:
                 return []
 
+        diff_changes = list(get_changes())
         diff_bytes = diff_files = 0
         if self.max_diff_bytes or self.max_diff_files:
-            for old_node, new_node, kind, change in get_changes():
+            for old_node, new_node, kind, change in diff_changes:
                 if change in Changeset.DIFF_CHANGES and kind == Node.FILE \
                         and old_node.is_viewable(req.perm) \
                         and new_node.is_viewable(req.perm):
@@ -602,7 +603,7 @@ class ChangesetModule(Component):
         filestats = self._prepare_filestats()
         changes = []
         files = []
-        for old_node, new_node, kind, change in get_changes():
+        for old_node, new_node, kind, change in diff_changes:
             props = []
             diffs = []
             show_old = old_node and old_node.is_viewable(req.perm)
@@ -665,24 +666,40 @@ class ChangesetModule(Component):
                      'longcol': 'Revision', 'shortcol': 'r'})
 
         if xhr: # render and return the content only
-            stream = Chrome(self.env).render_template(req, 'changeset.html',
-                                                      data, fragment=True)
-            content = stream.select('//div[@id="content"]')
-            str_content = content.render('xhtml', encoding='utf-8')
-            req.send_header('Content-Length', len(str_content))
-            req.end_headers()
-            req.write(str_content)
-            raise RequestDone
+            chrome = Chrome(self.env)
+            stream = chrome.render_template(req, 'changeset.html', data,
+                                            fragment=True)
+            stream = stream.select('//div[@id="content"]')
+            if chrome.use_chunked_encoding:
+                output = chrome.iterable_content(stream, 'xhtml')
+            else:
+                output = stream.render('xhtml', encoding='utf-8')
+            req.send(output)
 
         return data
 
     def _render_diff(self, req, filename, repos, data):
         """Raw Unified Diff version"""
+
+        output = (line.encode('utf-8') if isinstance(line, unicode) else line
+                  for line in self._iter_diff_lines(req, repos, data))
+        if Chrome(self.env).use_chunked_encoding:
+            length = None
+        else:
+            output = ''.join(output)
+            length = len(output)
+
         req.send_response(200)
         req.send_header('Content-Type', 'text/x-patch;charset=utf-8')
         req.send_header('Content-Disposition',
                         content_disposition('attachment', filename + '.diff'))
-        buf = StringIO()
+        if length is not None:
+            req.send_header('Content-Length', length)
+        req.end_headers()
+        req.write(output)
+        raise RequestDone
+
+    def _iter_diff_lines(self, req, repos, data):
         mimeview = Mimeview(self.env)
 
         for old_node, new_node, kind, change in repos.get_changes(
@@ -736,64 +753,27 @@ class ChangesetModule(Component):
                 ignore_space = options.get('ignorewhitespace')
                 if not old_node_info[0]:
                     old_node_info = new_node_info # support for 'A'dd changes
-                buf.write('Index: ' + new_path + CRLF)
-                buf.write('=' * 67 + CRLF)
-                buf.write('--- %s\t(revision %s)' % old_node_info + CRLF)
-                buf.write('+++ %s\t(revision %s)' % new_node_info + CRLF)
+                yield 'Index: ' + new_path + CRLF
+                yield '=' * 67 + CRLF
+                yield '--- %s\t(revision %s)' % old_node_info + CRLF
+                yield '+++ %s\t(revision %s)' % new_node_info + CRLF
                 for line in unified_diff(old_content.splitlines(),
                                          new_content.splitlines(), context,
                                          ignore_blank_lines=ignore_blank_lines,
                                          ignore_case=ignore_case,
                                          ignore_space_changes=ignore_space):
-                    buf.write(line + CRLF)
+                    yield line + CRLF
 
-        diff_str = buf.getvalue().encode('utf-8')
-        req.send_header('Content-Length', len(diff_str))
-        req.end_headers()
-        req.write(diff_str)
-        raise RequestDone
-
-    def _render_zip(self, req, filename, repos, data):
-        """ZIP archive containing all the added and/or modified files."""
-        req.send_response(200)
-        req.send_header('Content-Type', 'application/zip')
-        req.send_header('Content-Disposition',
-                        content_disposition('attachment', filename + '.zip'))
-
-        from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED as compression
-
-        buf = StringIO()
-        zipfile = ZipFile(buf, 'w', compression)
+    def _zip_iter_nodes(self, req, repos, data, root_node):
+        """Node iterator yielding all the added and/or modified files."""
         for old_node, new_node, kind, change in repos.get_changes(
             new_path=data['new_path'], new_rev=data['new_rev'],
             old_path=data['old_path'], old_rev=data['old_rev']):
             if (kind == Node.FILE or kind == Node.DIRECTORY) and \
                     change != Changeset.DELETE \
                     and new_node.is_viewable(req.perm):
-                zipinfo = ZipInfo()
-                # Note: unicode filenames are not supported by zipfile.
-                # UTF-8 is not supported by all Zip tools either,
-                # but as some do, UTF-8 is the best option here.
-                zipinfo.filename = new_node.path.strip('/').encode('utf-8')
-                zipinfo.flag_bits |= 0x800 # filename is encoded with utf-8
-                zipinfo.date_time = new_node.last_modified.utctimetuple()[:6]
-                zipinfo.compress_type = compression
-                # setting zipinfo.external_attr is needed since Python 2.5
-                if new_node.isfile:
-                    zipinfo.external_attr = 0644 << 16L
-                    content = new_node.get_content().read()
-                elif new_node.isdir:
-                    zipinfo.filename += '/'
-                    zipinfo.external_attr = 040755 << 16L
-                    content = ''
-                zipfile.writestr(zipinfo, content)
-        zipfile.close()
+                yield new_node
 
-        zip_str = buf.getvalue()
-        req.send_header("Content-Length", len(zip_str))
-        req.end_headers()
-        req.write(zip_str)
-        raise RequestDone
 
     def title_for_diff(self, data):
         # TRANSLATOR: 'latest' (revision)
@@ -1152,23 +1132,29 @@ class ChangesetModule(Component):
         rm = RepositoryManager(self.env)
         repositories = dict((repos.params['id'], repos)
                             for repos in rm.get_real_repositories())
+        uids_seen = set()
         with self.env.db_query as db:
             sql, args = search_to_sql(db, ['rev', 'message', 'author'], terms)
             for id, rev, ts, author, log in db("""
                     SELECT repos, rev, time, author, message
                     FROM revision WHERE """ + sql,
                     args):
-                try:
-                    rev = int(rev)
-                except ValueError:
-                    pass
                 repos = repositories.get(id)
                 if not repos:
                     continue # revisions for a no longer active repository
+                try:
+                    rev = repos.normalize_rev(rev)
+                    drev = repos.display_rev(rev)
+                except NoSuchChangeset:
+                    continue
+                uid = repos.get_changeset_uid(rev)
+                if uid in uids_seen:
+                    continue
                 cset = repos.resource.child('changeset', rev)
                 if 'CHANGESET_VIEW' in req.perm(cset):
+                    uids_seen.add(uid)
                     yield (req.href.changeset(rev, repos.reponame or None),
-                           '[%s]: %s' % (rev, shorten_line(log)),
+                           '[%s]: %s' % (drev, shorten_line(log)),
                            from_utimestamp(ts), author,
                            shorten_result(log, terms))
 
@@ -1205,7 +1191,7 @@ class AnyDiffModule(Component):
                                if repos.is_viewable(req.perm))
 
             elem = tag.ul(
-                [tag.li(tag.b(path) if isdir else path)
+                [tag.li(tag.strong(path) if isdir else path)
                  for (isdir, name, path) in sorted(entries, key=kind_order)
                  if name.lower().startswith(prefix)])
 

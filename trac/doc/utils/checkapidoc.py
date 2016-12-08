@@ -1,4 +1,16 @@
-# -*- coding:  utf-8 -*-
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2012-2013 Edgewall Software
+# Copyright (C) 2012 Christian Boos <cboos@edgewall.org>
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.com/license.html.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/.
 
 """Trac API doc checker
 
@@ -99,7 +111,8 @@ sphinx_doc_re = re.compile(r'''
 ''', re.MULTILINE | re.VERBOSE)
 
 def get_sphinx_documented_symbols(rst):
-    doc = file(os.path.join(api_doc, rst)).read()
+    with open(os.path.join(api_doc, rst)) as f:
+        doc = f.read()
     symbols, keywords = [], []
     for k, s in sphinx_doc_re.findall(doc):
         symbols.append(s.split('.')[-1])
@@ -145,7 +158,8 @@ def get_imported_symbols(module, has_submodules):
     src_filename = module.__file__.replace('\\', '/').replace('.pyc', '.py')
     if src_filename.endswith('/__init__.py') and not has_submodules:
         return set()
-    src = file(src_filename).read()
+    with open(src_filename) as f:
+        src = f.read()
     imported = set()
     for mod, symbol_list in import_from_re.findall(src):
         symbol_list = symbol_list.strip()

@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
 #
+# Copyright (C) 2008-2014 Edgewall Software
+# Copyright (C) 2008 Noah Kantrowitz <noah@coderanger.net>
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.com/license.html.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/.
+
 # Trac documentation build configuration file, created by
 # sphinx-quickstart on Wed May 14 09:05:13 2008.
 #
@@ -13,29 +25,30 @@
 # All configuration values have a default value; values that are
 # commented out serve to show the default value.
 
-import sys, os
+import os
+import sys
+from datetime import datetime
+
+from trac.util import get_pkginfo
+
+pkg_info = get_pkginfo(sys.modules['trac'])
 
 # General substitutions.
 project = 'Trac'
-copyright = '2012, Edgewall Software'
-url = 'http://trac.edgewall.org'
+copyright = '%s, Edgewall Software' % datetime.now().year
+url = pkg_info['home_page']
 
 # The default replacements for |version| and |release|, also used in various
 # other places throughout the built documents.
 #
 # The short X.Y version.
-version = '1.0.1'
+version = pkg_info['version'].split('dev')[0]
 # The full version, including alpha/beta/rc tags.
-release = '1.0.1'
+release = pkg_info['version']
 
 # Devel or Release mode for the documentation (if devel, include TODOs,
 # can also be used in conditionals: .. ifconfig :: devel)
-devel = True
-
-if devel:
-    release += 'dev'
-
-
+devel = 'dev' in pkg_info['version']
 
 # If your extensions are in another directory, add it here. If the
 # directory is relative to the documentation root, use os.path.abspath

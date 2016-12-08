@@ -21,13 +21,16 @@ from datetime import datetime
 from genshi.builder import tag
 
 from trac.core import *
+from trac.perm import IPermissionRequestor
 from trac.ticket import TicketSystem, Ticket
+from trac.ticket.default_workflow import ConfigurableTicketWorkflow
 from trac.ticket.notification import BatchTicketNotifyEmail
-from trac.util.datefmt import utc
+from trac.util.datefmt import datetime_now, utc
 from trac.util.text import exception_to_unicode, to_unicode
 from trac.util.translation import _, tag_
 from trac.web import IRequestHandler
 from trac.web.chrome import add_warning, add_script_data
+
 
 class BatchModifyModule(Component):
     """Ticket batch modification module.
@@ -39,7 +42,7 @@ class BatchModifyModule(Component):
     modify.
     """
 
-    implements(IRequestHandler)
+    implements(IPermissionRequestor, IRequestHandler)
 
     list_separator_re =  re.compile(r'[;\s,]+')
     list_connector_string = ', '
@@ -63,6 +66,12 @@ class BatchModifyModule(Component):
 
         #Always redirect back to the query page we came from.
         req.redirect(req.session['query_href'])
+
+    # IPermissionRequestor methods
+
+    def get_permission_actions(self):
+        return ['TICKET_BATCH_MODIFY',
+                ('TICKET_ADMIN', ['TICKET_BATCH_MODIFY'])]
 
     def _get_new_ticket_values(self, req):
         """Pull all of the new values out of the post data."""
@@ -111,10 +120,19 @@ class BatchModifyModule(Component):
         tickets_by_action = {}
         for t in tickets:
             ticket = Ticket(self.env, t['id'])
-            actions = ts.get_available_actions(req, ticket)
-            for action in actions:
+            available_actions = ts.get_available_actions(req, ticket)
+            for action in available_actions:
                 tickets_by_action.setdefault(action, []).append(ticket)
-        sorted_actions = sorted(set(tickets_by_action.keys()))
+
+        # Sort the allowed actions by the 'default' key.
+        allowed_actions = set(tickets_by_action.keys())
+        workflow = ConfigurableTicketWorkflow(self.env)
+        all_actions = sorted(((action['default'], name)
+                              for name, action
+                              in workflow.get_all_actions().iteritems()),
+                             reverse=True)
+        sorted_actions = [action[1] for action in all_actions
+                                    if action[1] in allowed_actions]
         for action in sorted_actions:
             first_label = None
             hints = []
@@ -142,7 +160,7 @@ class BatchModifyModule(Component):
     def _save_ticket_changes(self, req, selected_tickets,
                              new_values, comment, action):
         """Save all of the changes to tickets."""
-        when = datetime.now(utc)
+        when = datetime_now(utc)
         list_fields = self._get_list_fields()
         with self.env.db_transaction as db:
             for id in selected_tickets:
@@ -167,10 +185,10 @@ class BatchModifyModule(Component):
                 t.save_changes(req.authname, comment, when=when)
                 for controller in controllers:
                     controller.apply_action_side_effects(req, t, action)
+        tn = BatchTicketNotifyEmail(self.env)
         try:
-            tn = BatchTicketNotifyEmail(self.env)
             tn.notify(selected_tickets, new_values, comment, action,
-                      req.authname)
+                      req.authname, when)
         except Exception, e:
             self.log.error("Failure sending notification on ticket batch"
                     "change: %s", exception_to_unicode(e))

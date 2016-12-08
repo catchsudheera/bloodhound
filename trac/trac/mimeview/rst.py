@@ -29,17 +29,16 @@ try:
     from docutils import nodes
     from docutils.core import publish_parts
     from docutils.parsers import rst
+    from docutils.readers import standalone
     from docutils import __version__
     has_docutils = True
 except ImportError:
     has_docutils = False
 
-from genshi.core import escape
-
 from trac.core import *
 from trac.env import ISystemInfoProvider
 from trac.mimeview.api import IHTMLPreviewRenderer, content_to_unicode
-from trac.util.html import Element, Fragment, Markup, find_element
+from trac.util.html import Element, Fragment, Markup, escape, find_element
 from trac.util.translation import _
 from trac.wiki.api import WikiSystem
 from trac.wiki.formatter import WikiProcessor, Formatter, extract_link
@@ -225,7 +224,7 @@ class ReStructuredTextRenderer(Component):
         if has_docutils:
             if StrictVersion(__version__) < StrictVersion('0.3.9'):
                 self.log.warning('Docutils version >= %s required, '
-                                 '%s found' % ('0.3.9', __version__))
+                                 '%s found', '0.3.9', __version__)
             else:
                 self.can_render = True
 
@@ -270,9 +269,10 @@ class ReStructuredTextRenderer(Component):
         inliner.trac = (self.env, context)
         parser = rst.Parser(inliner=inliner)
         content = content_to_unicode(self.env, content, mimetype)
+        # The default Reader is explicitly passed as a workaround for #11248
         parts = publish_parts(content, writer=writer, parser=parser,
+                              reader=standalone.Reader(parser),
                               settings_overrides={'halt_level': 6,
-                                                  'warning_stream': False,
                                                   'file_insertion_enabled': 0,
                                                   'raw_enabled': 0,
                                                   'warning_stream': False})

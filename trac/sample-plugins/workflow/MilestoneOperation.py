@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 #
+# Copyright (C) 2002-2013 Edgewall Software
 # Copyright (C) 2012 Franz Mayer <franz.mayer@gefasoft.de>
+# All rights reserved.
 #
-# "THE BEER-WARE LICENSE" (Revision 42):
-# <franz.mayer@gefasoft.de> wrote this file.  As long as you retain this
-# notice you can do whatever you want with this stuff. If we meet some day,
-# and you think this stuff is worth it, you can buy me a beer in return.
-# Franz Mayer
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.com/license.html.
 #
-# Author: Franz Mayer <franz.mayer@gefasoft.de>
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/.
 
 from genshi.builder import tag
 
@@ -58,7 +60,7 @@ workflow = ConfigurableTicketWorkflow,MilestoneOperation
             controller = ConfigurableTicketWorkflow(self.env)
             actions_we_handle = controller.get_actions_by_operation_for_req(
                 req, ticket, 'set_milestone')
-        self.log.debug('set_milestone handles actions: %r' % actions_we_handle)
+        self.log.debug('set_milestone handles actions: %r', actions_we_handle)
         return actions_we_handle
 
     def get_all_status(self):
@@ -76,9 +78,16 @@ workflow = ConfigurableTicketWorkflow,MilestoneOperation
             else:
                 resolutions = "'%s'" % resolution
                 milestone = res_ms[resolution]
-        hint = _("For resolution %(resolutions)s the milestone will be "
-                 "set to '%(milestone)s'.",
-                 resolutions=resolutions, milestone=milestone)
+        hint = None
+        if res_ms:
+            try:
+                Milestone(self.env, milestone)
+            except ResourceNotFound:
+                pass
+            else:
+                hint = _("For resolution %(resolutions)s the milestone will "
+                         "be set to '%(milestone)s'.",
+                         resolutions=resolutions, milestone=milestone)
         return (label, None, hint)
 
     def get_ticket_changes(self, req, ticket, action):
@@ -96,8 +105,8 @@ workflow = ConfigurableTicketWorkflow,MilestoneOperation
                 if new_milestone is not None or user_milestone is None:
                     try:
                         milestone = Milestone(self.env, new_milestone)
-                        self.log.info('changed milestone from %s to %s' %
-                                      (old_milestone, new_milestone) )
+                        self.log.info('changed milestone from %s to %s',
+                                      old_milestone, new_milestone)
                         return {'milestone': new_milestone}
                     except ResourceNotFound:
                         add_warning(req, _("Milestone %(name)s does not exist.",
@@ -117,8 +126,9 @@ workflow = ConfigurableTicketWorkflow,MilestoneOperation
         transitions = self.config.get('ticket-workflow',
                                       action + '.milestone').strip()
         transition = [x.strip() for x in transitions.split('->')]
-        resolutions = [y.strip() for y in transition[0].split(',')]
         res_milestone = {}
-        for res in resolutions:
-            res_milestone[res] = transition[1]
+        if len(transition) == 2:
+            resolutions = [y.strip() for y in transition[0].split(',')]
+            for res in resolutions:
+                res_milestone[res] = transition[1]
         return res_milestone

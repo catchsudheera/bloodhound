@@ -27,7 +27,6 @@ import sys
 from SocketServer import ThreadingMixIn
 
 from trac import __version__ as VERSION
-from trac.hooks import load_bootstrap_handler
 from trac.util import autoreload, daemon
 from trac.web.auth import BasicAuthentication, DigestAuthentication
 from trac.web.main import dispatch_request
@@ -57,31 +56,6 @@ class AuthenticationMiddleware(object):
                     if not remote_user:
                         return []
                     environ['REMOTE_USER'] = remote_user
-        return self.application(environ, start_response)
-
-
-class BootstrapAuthenticationMiddleware(AuthenticationMiddleware):
-    """Authentication middleware for custom web bootstrap handlers
-    """
-    def __call__(self, environ, start_response):
-        bootstrap_ep = os.getenv('TRAC_BOOTSTRAP_HANDLER')
-        environ.setdefault('trac.bootstrap_handler', bootstrap_ep)
-
-        # Preserve original environ and probe dispatching
-        temp_environ = environ.copy()
-        bootstrap = load_bootstrap_handler(bootstrap_ep)
-        bootstrap.probe_environment(temp_environ)
-
-        path_info = temp_environ.get('PATH_INFO', '')
-        path_parts = filter(None, path_info.split('/'))
-        env_name = temp_environ.get('trac.env_name')
-        if path_parts and path_parts[0] == 'login' and env_name:
-            auth = self.auths.get(env_name, self.auths.get('*'))
-            if auth:
-                remote_user = auth.do_auth(environ, start_response)
-                if not remote_user:
-                    return []
-                environ['REMOTE_USER'] = remote_user
         return self.application(environ, start_response)
 
 
@@ -145,6 +119,7 @@ class TracHTTPRequestHandler(WSGIRequestHandler):
 
 class TracHTTP11RequestHandler(TracHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
 
 def main():
     from optparse import OptionParser, OptionValueError
@@ -295,19 +270,15 @@ def main():
     if parser.has_option('pidfile') and options.pidfile:
         options.pidfile = os.path.abspath(options.pidfile)
 
-    wsgi_app = dispatch_request
-
+    wsgi_app = TracEnvironMiddleware(dispatch_request,
+                                     options.env_parent_dir, args,
+                                     options.single_env)
     if auths:
         if options.single_env:
             project_name = os.path.basename(args[0])
-            wsgi_app = BootstrapAuthenticationMiddleware(wsgi_app, auths, project_name)
+            wsgi_app = AuthenticationMiddleware(wsgi_app, auths, project_name)
         else:
-            wsgi_app = BootstrapAuthenticationMiddleware(wsgi_app, auths)
-
-    wsgi_app = TracEnvironMiddleware(wsgi_app,
-                                     options.env_parent_dir, args,
-                                     options.single_env)
-
+            wsgi_app = AuthenticationMiddleware(wsgi_app, auths)
     base_path = options.base_path.strip('/')
     if base_path:
         wsgi_app = BasePathMiddleware(wsgi_app, base_path)

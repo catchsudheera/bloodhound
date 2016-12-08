@@ -38,9 +38,9 @@ from trac.mimeview import *
 from trac.perm import PermissionError, IPermissionPolicy
 from trac.resource import *
 from trac.search import search_to_sql, shorten_result
-from trac.util import content_disposition, get_reporter_id
+from trac.util import content_disposition, create_zipinfo, get_reporter_id
 from trac.util.compat import sha1
-from trac.util.datefmt import format_datetime, from_utimestamp, \
+from trac.util.datefmt import datetime_now, format_datetime, from_utimestamp, \
                               to_datetime, to_utimestamp, utc
 from trac.util.text import exception_to_unicode, path_to_unicode, \
                            pretty_size, print_table, unicode_unquote
@@ -93,8 +93,9 @@ class IAttachmentManipulator(Interface):
         attachment. Therefore, a return value of ``[]`` means
         everything is OK."""
 
+
 class ILegacyAttachmentPolicyDelegate(Interface):
-    """Interface that can be used by plugins to seemlessly participate
+    """Interface that can be used by plugins to seamlessly participate
        to the legacy way of checking for attachment permissions.
 
        This should no longer be necessary once it becomes easier to
@@ -118,6 +119,10 @@ class ILegacyAttachmentPolicyDelegate(Interface):
 
 
 class Attachment(object):
+    """Represents an attachment (new or existing).
+
+    :since 1.0.5: `ipnr` is deprecated and will be removed in 1.3.1
+    """
 
     def __init__(self, env, parent_realm_or_attachment_resource,
                  parent_id=None, filename=None, db=None):
@@ -221,7 +226,7 @@ class Attachment(object):
         with self.env.db_transaction as db:
             db("""
                 DELETE FROM attachment WHERE type=%s AND id=%s AND filename=%s
-                    """, (self.parent_realm, self.parent_id, self.filename))
+                """, (self.parent_realm, self.parent_id, self.filename))
             path = self.path
             if os.path.isfile(path):
                 try:
@@ -233,11 +238,10 @@ class Attachment(object):
                                        exception_to_unicode(e, traceback=True))
                     raise TracError(_("Could not delete attachment"))
 
-        self.env.log.info("Attachment removed: %s" % self.title)
+        self.env.log.info("Attachment removed: %s", self.title)
 
         for listener in AttachmentModule(self.env).change_listeners:
             listener.attachment_deleted(self)
-        ResourceSystem(self.env).resource_deleted(self)
 
     def reparent(self, new_realm, new_id):
         assert self.filename, "Cannot reparent non-existent attachment"
@@ -283,17 +287,11 @@ class Attachment(object):
         self.resource = Resource(new_realm, new_id).child('attachment',
                                                           self.filename)
 
-        self.env.log.info("Attachment reparented: %s" % self.title)
+        self.env.log.info("Attachment reparented: %s", self.title)
 
         for listener in AttachmentModule(self.env).change_listeners:
             if hasattr(listener, 'attachment_reparented'):
                 listener.attachment_reparented(self, old_realm, old_id)
-        old_values = dict()
-        if self.parent_realm != old_realm:
-            old_values["parent_realm"] = old_realm
-        if self.parent_id != old_id:
-            old_values["parent_id"] = old_id
-        ResourceSystem(self.env).resource_changed(self, old_values=old_values)
 
     def insert(self, filename, fileobj, size, t=None, db=None):
         """Create a new Attachment record and save the file content.
@@ -305,10 +303,16 @@ class Attachment(object):
         self.size = int(size) if size else 0
         self.filename = None
         if t is None:
-            t = datetime.now(utc)
+            t = datetime_now(utc)
         elif not isinstance(t, datetime): # Compatibility with 0.11
             t = to_datetime(t, utc)
         self.date = t
+
+        parent_resource = self.resource.parent
+        if not resource_exists(self.env, parent_resource):
+            raise ResourceNotFound(
+                _("%(parent)s doesn't exist, can't create attachment",
+                  parent=get_resource_name(self.env, parent_resource)))
 
         # Make sure the path to the attachment is inside the environment
         # attachments directory
@@ -339,17 +343,17 @@ class Attachment(object):
 
         for listener in AttachmentModule(self.env).change_listeners:
             listener.attachment_added(self)
-        ResourceSystem(self.env).resource_created(self)
-
 
     @classmethod
     def select(cls, env, parent_realm, parent_id, db=None):
         """Iterator yielding all `Attachment` instances attached to
         resource identified by `parent_realm` and `parent_id`.
 
-        .. versionchanged :: 1.0
-           the `db` parameter is no longer needed
-           (will be removed in version 1.1.1)
+        :returns: a tuple containing the `filename`, `description`, `size`,
+                  `time`, `author` and `ipnr`.
+        :since 1.0: the `db` parameter is deprecated and will be removed
+                    in 1.1.1
+        :since 1.0.5: use of `ipnr` is deprecated and will be removed in 1.3.1
         """
         for row in env.db_query("""
                 SELECT filename, description, size, time, author, ipnr
@@ -377,7 +381,8 @@ class Attachment(object):
                 os.rmdir(attachment_dir)
             except OSError, e:
                 env.log.error("Can't delete attachment directory %s: %s",
-                    attachment_dir, exception_to_unicode(e, traceback=True))
+                              attachment_dir,
+                              exception_to_unicode(e, traceback=True))
 
     @classmethod
     def reparent_all(cls, env, parent_realm, parent_id, new_realm, new_id):
@@ -393,7 +398,8 @@ class Attachment(object):
                 os.rmdir(attachment_dir)
             except OSError, e:
                 env.log.error("Can't delete attachment directory %s: %s",
-                    attachment_dir, exception_to_unicode(e, traceback=True))
+                              attachment_dir,
+                              exception_to_unicode(e, traceback=True))
 
     def open(self):
         path = self.path
@@ -436,8 +442,7 @@ class AttachmentModule(Component):
     CHUNK_SIZE = 4096
 
     max_size = IntOption('attachment', 'max_size', 262144,
-        """Maximum allowed file size (in bytes) for ticket and wiki
-        attachments.""")
+        """Maximum allowed file size (in bytes) for attachments.""")
 
     max_zip_size = IntOption('attachment', 'max_zip_size', 2097152,
         """Maximum allowed total size (in bytes) for an attachment list to be
@@ -486,6 +491,9 @@ class AttachmentModule(Component):
 
         if not parent_realm or not path:
             raise HTTPBadRequest(_('Bad request'))
+        if parent_realm == 'attachment':
+            raise TracError(tag_("%(realm)s is not a valid parent realm",
+                                 realm=tag.tt(parent_realm)))
 
         parent_realm = Resource(parent_realm)
         action = req.args.get('action', 'view')
@@ -499,6 +507,10 @@ class AttachmentModule(Component):
                 parent_id, filename = path[:last_slash], path[last_slash + 1:]
 
         parent = parent_realm(id=parent_id)
+        if not resource_exists(self.env, parent):
+            raise ResourceNotFound(
+                _("Parent resource %(parent)s doesn't exist",
+                  parent=get_resource_name(self.env, parent)))
 
         # Link the attachment page to parent resource
         parent_name = get_resource_name(self.env, parent)
@@ -520,6 +532,8 @@ class AttachmentModule(Component):
                 data = self._do_save(req, attachment)
             elif action == 'delete':
                 self._do_delete(req, attachment)
+            else:
+                raise HTTPBadRequest(_("Invalid request arguments."))
         elif action == 'delete':
             data = self._render_confirm_delete(req, attachment)
         elif action == 'new':
@@ -666,22 +680,17 @@ class AttachmentModule(Component):
     def get_resource_description(self, resource, format=None, **kwargs):
         if not resource.parent:
             return _("Unparented attachment %(id)s", id=resource.id)
-        nbhprefix = ResourceSystem(self.env).neighborhood_prefix(
-                resource.neighborhood)
         if format == 'compact':
-            return '%s%s (%s)' % (nbhprefix, resource.id,
+            return '%s (%s)' % (resource.id,
                     get_resource_name(self.env, resource.parent))
         elif format == 'summary':
             return Attachment(self.env, resource).description
         if resource.id:
-            desc = _("Attachment '%(id)s' in %(parent)s", id=resource.id,
+            return _("Attachment '%(id)s' in %(parent)s", id=resource.id,
                      parent=get_resource_name(self.env, resource.parent))
         else:
-            desc = _("Attachments of %(parent)s",
+            return _("Attachments of %(parent)s",
                      parent=get_resource_name(self.env, resource.parent))
-        if resource.neighborhood is not None:
-            desc = nbhprefix + desc
-        return desc
 
     def resource_exists(self, resource):
         try:
@@ -695,15 +704,11 @@ class AttachmentModule(Component):
     def _do_save(self, req, attachment):
         req.perm(attachment.resource).require('ATTACHMENT_CREATE')
         parent_resource = attachment.resource.parent
-        if not resource_exists(self.env, parent_resource):
-            raise ResourceNotFound(
-                _("%(parent)s doesn't exist, can't create attachment",
-                  parent=get_resource_name(self.env, parent_resource)))
 
         if 'cancel' in req.args:
             req.redirect(get_resource_url(self.env, parent_resource, req.href))
 
-        upload = req.args['attachment']
+        upload = req.args.getfirst('attachment')
         if not hasattr(upload, 'filename') or not upload.filename:
             raise TracError(_('No file uploaded'))
         if hasattr(upload.file, 'fileno'):
@@ -764,7 +769,7 @@ class AttachmentModule(Component):
             try:
                 old_attachment = Attachment(self.env,
                                             attachment.resource(id=filename))
-                if not (req.authname and req.authname != 'anonymous' \
+                if not (req.authname and req.authname != 'anonymous'
                         and old_attachment.author == req.authname) \
                    and 'ATTACHMENT_DELETE' \
                                         not in req.perm(attachment.resource):
@@ -774,7 +779,7 @@ class AttachmentModule(Component):
                         "attachments requires ATTACHMENT_DELETE permission.",
                         name=filename))
                 if (not attachment.description.strip() and
-                    old_attachment.description):
+                        old_attachment.description):
                     attachment.description = old_attachment.description
                 old_attachment.delete()
             except TracError:
@@ -806,7 +811,7 @@ class AttachmentModule(Component):
     def _render_form(self, req, attachment):
         req.perm(attachment.resource).require('ATTACHMENT_CREATE')
         return {'mode': 'new', 'author': get_reporter_id(req),
-            'attachment': attachment, 'max_size': self.max_size}
+                'attachment': attachment, 'max_size': self.max_size}
 
     def _download_as_zip(self, req, parent, attachments=None):
         if attachments is None:
@@ -823,19 +828,14 @@ class AttachmentModule(Component):
         req.send_header('Content-Disposition',
                         content_disposition('inline', filename))
 
-        from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+        from zipfile import ZipFile, ZIP_DEFLATED
 
         buf = StringIO()
         zipfile = ZipFile(buf, 'w', ZIP_DEFLATED)
         for attachment in attachments:
-            zipinfo = ZipInfo()
-            zipinfo.filename = attachment.filename.encode('utf-8')
-            zipinfo.flag_bits |= 0x800 # filename is encoded with utf-8
-            zipinfo.date_time = attachment.date.utctimetuple()[:6]
-            zipinfo.compress_type = ZIP_DEFLATED
-            if attachment.description:
-                zipinfo.comment = attachment.description.encode('utf-8')
-            zipinfo.external_attr = 0644 << 16L # needed since Python 2.5
+            zipinfo = create_zipinfo(attachment.filename,
+                                     mtime=attachment.date,
+                                     comment=attachment.description)
             try:
                 with attachment.open() as fd:
                     zipfile.writestr(zipinfo, fd.read())
@@ -911,8 +911,8 @@ class AttachmentModule(Component):
             add_link(req, 'alternate', raw_href, _('Original Format'),
                      mime_type)
 
-            self.log.debug("Rendering preview of file %s with mime-type %s"
-                           % (attachment.filename, mime_type))
+            self.log.debug("Rendering preview of file %s with mime-type %s",
+                           attachment.filename, mime_type)
 
             data['preview'] = mimeview.preview_data(
                 web_context(req, attachment.resource), fd,
@@ -993,13 +993,13 @@ class LegacyAttachmentPolicy(Component):
             decision = legacy_action in perm(resource.parent)
             if not decision:
                 self.log.debug('LegacyAttachmentPolicy denied %s access to '
-                               '%s. User needs %s' %
-                               (username, resource, legacy_action))
+                               '%s. User needs %s',
+                               username, resource, legacy_action)
             return decision
         else:
             for d in self.delegates:
                 decision = d.check_attachment_permission(action, username,
-                        resource, perm)
+                                                         resource, perm)
                 if decision is not None:
                     return decision
 
@@ -1113,4 +1113,3 @@ class AttachmentAdmin(Component):
             finally:
                 if destination is not None:
                     output.close()
-

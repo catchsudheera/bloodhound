@@ -18,23 +18,26 @@ from BaseHTTPServer import BaseHTTPRequestHandler
 from Cookie import CookieError, BaseCookie, SimpleCookie
 import cgi
 from datetime import datetime
-import errno
 from hashlib import md5
 import new
 import mimetypes
 import os
+import re
 import socket
 from StringIO import StringIO
 import sys
 import urlparse
 
+from genshi.builder import Fragment
 from trac.core import Interface, TracError
+from trac.perm import PermissionError
 from trac.util import get_last_traceback, unquote
 from trac.util.datefmt import http_date, localtz
-from trac.util.text import empty, to_unicode
-from trac.util.translation import _
+from trac.util.text import empty, exception_to_unicode, to_unicode
+from trac.util.translation import _, N_
 from trac.web.href import Href
-from trac.web.wsgi import _FileWrapper
+from trac.web.wsgi import _FileWrapper, is_client_disconnect_exception
+
 
 class IAuthenticator(Interface):
     """Extension point interface for components that can provide the name
@@ -122,6 +125,18 @@ class ITemplateStreamFilter(Interface):
         """
 
 
+class TracNotImplementedError(TracError, NotImplementedError):
+    """Raised when a `NotImplementedError` is trapped.
+
+    This exception is for internal use and should not be raised by
+    plugins. Plugins should raise `NotImplementedError`.
+
+    :since: 1.0.11
+    """
+
+    title = N_("Not Implemented Error")
+
+
 HTTP_STATUS = dict([(code, reason.title()) for code, (reason, description)
                     in BaseHTTPRequestHandler.responses.items()])
 
@@ -129,15 +144,46 @@ HTTP_STATUS = dict([(code, reason.title()) for code, (reason, description)
 class HTTPException(Exception):
 
     def __init__(self, detail, *args):
-        if isinstance(detail, TracError):
+        """Factory for HTTPException classes."""
+        if isinstance(detail, (TracError, PermissionError)):
             self.detail = detail.message
             self.reason = detail.title
         else:
             self.detail = detail
         if args:
             self.detail = self.detail % args
-        Exception.__init__(self, '%s %s (%s)' % (self.code, self.reason,
-                                                 self.detail))
+        super(HTTPException, self).__init__('%s %s (%s)' % (self.code,
+                                                            self.reason,
+                                                            self.detail))
+
+    @property
+    def message(self):
+        # The message is based on the e.detail, which can be an Exception
+        # object, but not a TracError one: when creating HTTPException,
+        # a TracError.message is directly assigned to e.detail
+        if isinstance(self.detail, Exception): # not a TracError or PermissionError
+            message = exception_to_unicode(self.detail)
+        elif isinstance(self.detail, Fragment): # TracError or PermissionError markup
+            message = self.detail
+        else:
+            message = to_unicode(self.detail)
+        return message
+
+    @property
+    def title(self):
+        try:
+            # We first try to get localized error messages here, but we
+            # should ignore secondary errors if the main error was also
+            # due to i18n issues
+            title = _("Error")
+            if self.reason:
+                if title.lower() in self.reason.lower():
+                    title = self.reason
+                else:
+                    title = _("Error: %(message)s", message=self.reason)
+        except Exception:
+            title = "Error"
+        return title
 
     @classmethod
     def subclass(cls, name, code):
@@ -243,6 +289,10 @@ class RequestDone(Exception):
     """Marker exception that indicates whether request processing has completed
     and a response was sent.
     """
+    iterable = None
+
+    def __init__(self, iterable=None):
+        self.iterable = iterable
 
 
 class Cookie(SimpleCookie):
@@ -319,9 +369,11 @@ class Request(object):
         raise AttributeError(name)
 
     def __repr__(self):
-        path_info = self.environ.get('PATH_INFO', '')
-        return '<%s "%s %r">' % (self.__class__.__name__, self.method,
-                                 path_info)
+        uri = self.environ.get('PATH_INFO', '')
+        qs = self.query_string
+        if qs:
+            uri += '?' + qs
+        return '<%s "%s %r">' % (self.__class__.__name__, self.method, uri)
 
     # Public API
 
@@ -356,7 +408,9 @@ class Request(object):
 
         Will be `None` if the user has not logged in using HTTP authentication.
         """
-        return self.environ.get('REMOTE_USER')
+        user = self.environ.get('REMOTE_USER')
+        if user is not None:
+            return to_unicode(user)
 
     @property
     def scheme(self):
@@ -405,11 +459,12 @@ class Request(object):
         `value` must either be an `unicode` string or can be converted to one
         (e.g. numbers, ...)
         """
-        if name.lower() == 'content-type':
+        lower_name = name.lower()
+        if lower_name == 'content-type':
             ctpos = value.find('charset=')
             if ctpos >= 0:
                 self._outcharset = value[ctpos + 8:].strip()
-        elif name.lower() == 'content-length':
+        elif lower_name == 'content-length':
             self._content_length = int(value)
         self._outheaders.append((name, unicode(value).encode('utf-8')))
 
@@ -442,13 +497,15 @@ class Request(object):
             extra = m.hexdigest()
         etag = 'W/"%s/%s/%s"' % (self.authname, http_date(datetime), extra)
         inm = self.get_header('If-None-Match')
-        if (not inm or inm != etag):
+        if not inm or inm != etag:
             self.send_header('ETag', etag)
         else:
             self.send_response(304)
             self.send_header('Content-Length', 0)
             self.end_headers()
             raise RequestDone
+
+    _trident_re = re.compile(r' Trident/([0-9]+)')
 
     def redirect(self, url, permanent=False):
         """Send a redirect to the client, forwarding to the specified URL.
@@ -472,10 +529,13 @@ class Request(object):
             scheme, host = urlparse.urlparse(self.base_url)[:2]
             url = urlparse.urlunparse((scheme, host, url, None, None, None))
 
-        # Workaround #10382, IE6+ bug when post and redirect with hash
-        if status == 303 and '#' in url and \
-                ' MSIE ' in self.environ.get('HTTP_USER_AGENT', ''):
-            url = url.replace('#', '#__msie303:')
+        # Workaround #10382, IE6-IE9 bug when post and redirect with hash
+        if status == 303 and '#' in url:
+            user_agent = self.environ.get('HTTP_USER_AGENT', '')
+            match_trident = self._trident_re.search(user_agent)
+            if ' MSIE ' in user_agent and \
+                    (not match_trident or int(match_trident.group(1)) < 6):
+                url = url.replace('#', '#__msie303:')
 
         self.send_header('Location', url)
         self.send_header('Content-Type', 'text/plain')
@@ -491,7 +551,8 @@ class Request(object):
         self.send_header('Cache-Control', 'must-revalidate')
         self.send_header('Expires', 'Fri, 01 Jan 1999 00:00:00 GMT')
         self.send_header('Content-Type', content_type + ';charset=utf-8')
-        self.send_header('Content-Length', len(content))
+        if isinstance(content, basestring):
+            self.send_header('Content-Length', len(content))
         self.end_headers()
 
         if self.method != 'HEAD':
@@ -577,11 +638,15 @@ class Request(object):
         self.send_header('Last-Modified', last_modified)
         use_xsendfile = getattr(self, 'use_xsendfile', False)
         if use_xsendfile:
-            self.send_header('X-Sendfile', os.path.abspath(path))
+            xsendfile_header = getattr(self, 'xsendfile_header', None)
+            if xsendfile_header:
+                self.send_header(xsendfile_header, os.path.abspath(path))
+            else:
+                use_xsendfile = False
         self.end_headers()
 
         if not use_xsendfile and self.method != 'HEAD':
-            fileobj = file(path, 'rb')
+            fileobj = open(path, 'rb')
             file_wrapper = self.environ.get('wsgi.file_wrapper', _FileWrapper)
             self._response = file_wrapper(fileobj, 4096)
         raise RequestDone
@@ -598,28 +663,45 @@ class Request(object):
         data = fileobj.read(size)
         return data
 
+    CHUNK_SIZE = 4096
+
     def write(self, data):
         """Write the given data to the response body.
 
-        `data` *must* be a `str` string, encoded with the charset
-        which has been specified in the ''Content-Type'' header
-        or 'utf-8' otherwise.
+        *data* **must** be a `str` string or an iterable instance
+        which iterates `str` strings, encoded with the charset which
+        has been specified in the ``'Content-Type'`` header or UTF-8
+        otherwise.
 
-        Note that the ''Content-Length'' header must have been specified.
-        Its value either corresponds to the length of `data`, or, if there
-        are multiple calls to `write`, to the cumulated length of the `data`
-        arguments.
+        Note that when the ``'Content-Length'`` header is specified,
+        its value either corresponds to the length of *data*, or, if
+        there are multiple calls to `write`, to the cumulative length
+        of the *data* arguments.
         """
         if not self._write:
             self.end_headers()
-        if not hasattr(self, '_content_length'):
-            raise RuntimeError("No Content-Length header set")
-        if isinstance(data, unicode):
-            raise ValueError("Can't send unicode content")
         try:
-            self._write(data)
+            chunk_size = self.CHUNK_SIZE
+            bufsize = 0
+            buf = []
+            buf_append = buf.append
+            if isinstance(data, basestring):
+                data = [data]
+            for chunk in data:
+                if isinstance(chunk, unicode):
+                    raise ValueError("Can't send unicode content")
+                if not chunk:
+                    continue
+                bufsize += len(chunk)
+                buf_append(chunk)
+                if bufsize >= chunk_size:
+                    self._write(''.join(buf))
+                    bufsize = 0
+                    buf[:] = ()
+            if bufsize > 0:
+                self._write(''.join(buf))
         except (IOError, socket.error), e:
-            if e.args[0] in (errno.EPIPE, errno.ECONNRESET, 10053, 10054):
+            if self._is_client_disconnected(e):
                 raise RequestDone
             raise
 
@@ -645,15 +727,39 @@ class Request(object):
         # requests. We'll keep the pre 2.6 behaviour for now...
         if self.method == 'POST':
             qs_on_post = self.environ.pop('QUERY_STRING', '')
-        fs = _FieldStorage(fp, environ=self.environ, keep_blank_values=True)
+        try:
+            fs = _FieldStorage(fp, environ=self.environ,
+                               keep_blank_values=True)
+        except (IOError, socket.error), e:
+            if self._is_client_disconnected(e):
+                raise HTTPBadRequest(
+                    _("Exception caught while reading request: %(msg)s",
+                      msg=exception_to_unicode(e)))
+            raise
         if self.method == 'POST':
             self.environ['QUERY_STRING'] = qs_on_post
+
+        def raise_if_null_bytes(value):
+            if value and '\x00' in value:
+                raise HTTPBadRequest(_("Invalid request arguments."))
 
         args = []
         for value in fs.list or ():
             name = value.name
-            if not value.filename:
-                value = unicode(value.value, 'utf-8')
+            raise_if_null_bytes(name)
+            try:
+                if name is not None:
+                    name = unicode(name, 'utf-8')
+                if value.filename:
+                    raise_if_null_bytes(value.filename)
+                else:
+                    value = value.value
+                    raise_if_null_bytes(value)
+                    value = unicode(value, 'utf-8')
+            except UnicodeDecodeError, e:
+                raise HTTPBadRequest(
+                    _("Invalid encoding in form data: %(msg)s",
+                      msg=exception_to_unicode(e)))
             args.append((name, value))
         return args
 
@@ -700,7 +806,7 @@ class Request(object):
             # server name and port
             default_port = {'http': 80, 'https': 443}
             if self.server_port and self.server_port != \
-                   default_port[self.scheme]:
+                    default_port[self.scheme]:
                 host = '%s:%d' % (self.server_name, self.server_port)
             else:
                 host = self.server_name
@@ -719,5 +825,16 @@ class Request(object):
         cookies = to_unicode(self.outcookie.output(header='')).encode('utf-8')
         for cookie in cookies.splitlines():
             self._outheaders.append(('Set-Cookie', cookie.strip()))
+
+    def _is_client_disconnected(self, e):
+        if is_client_disconnect_exception(e):
+            return True
+        # Note that mod_wsgi raises an IOError with only a message
+        # if the client disconnects
+        if 'mod_wsgi.version' in self.environ:
+            return e.args[0] in ('failed to write data',
+                                 'client connection closed',
+                                 'request data read error')
+        return False
 
 __no_apidoc__ = _HTTPException_subclass_names

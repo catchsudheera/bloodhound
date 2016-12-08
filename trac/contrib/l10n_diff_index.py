@@ -1,5 +1,17 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
 # Copyright (C) 2013 Edgewall Software
-# This file is distributed under the same license as the Trac project.
+# Copyright (C) 2013 Christian Boos <cboos@edgewall.org>
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.com/license.html.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/.
 
 """
 
@@ -74,11 +86,12 @@ def index_diffs(path, diffs):
     return index
 
 def write_index_for(path):
-    diffs = unicode(file(path, 'rb').read(), 'utf-8')
+    with open(path, 'rb') as f:
+        diffs = unicode(f.read(), 'utf-8')
     changes = index_diffs(path, diffs)
     if changes:
         index = path + '.index'
-        with file(index, 'wb') as idx:
+        with open(index, 'wb') as idx:
             for n, line in changes:
                 print>>idx, (u"%s:%s: %s" % (path, n, line)).encode('utf-8')
         print "%s: %d changes indexed in %s" % (path, len(changes), index)

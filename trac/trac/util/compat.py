@@ -17,7 +17,9 @@
 previous versions of Python from 2.5 onward.
 """
 
+import math
 import os
+import time
 
 # Import symbols previously defined here, kept around so that plugins importing
 # them don't suddenly stop working
@@ -31,7 +33,24 @@ from functools import partial
 from hashlib import md5, sha1
 from itertools import groupby, tee
 
+
+try:
+    import crypt
+    crypt = crypt.crypt
+except ImportError:
+    try:
+        import fcrypt
+        crypt = fcrypt.crypt
+    except ImportError:
+        crypt = None
+
+
 class py_groupby(object):
+    """Use in templates as an alternative to `itertools.groupby`,
+    which leaks memory for Python < 2.5.3.
+
+    This class will be removed in Trac 1.3.1.
+    """
     def __init__(self, iterable, key=None):
         if key is None:
             key = lambda x: x
@@ -95,3 +114,21 @@ except ImportError:
             while lines and not lines[0]:
                 lines.pop(0)
             return '\n'.join(lines)
+
+
+def wait_for_file_mtime_change(filename):
+    """This function is typically called before a file save operation,
+    waiting if necessary for the file modification time to change. The
+    purpose is to avoid successive file updates going undetected by the
+    caching mechanism that depends on a change in the file modification
+    time to know when the file should be reparsed."""
+
+    from trac.util import touch_file
+    try:
+        mtime = os.stat(filename).st_mtime
+        touch_file(filename)
+        while mtime == os.stat(filename).st_mtime:
+            time.sleep(1e-3)
+            touch_file(filename)
+    except OSError:
+        pass  # file doesn't exist (yet)

@@ -17,7 +17,6 @@
 from __future__ import with_statement
 
 import csv
-from datetime import datetime
 import pkg_resources
 import re
 from StringIO import StringIO
@@ -38,26 +37,25 @@ from trac.ticket.api import TicketSystem, ITicketManipulator
 from trac.ticket.model import Milestone, Ticket, group_milestones
 from trac.ticket.notification import TicketNotifyEmail
 from trac.timeline.api import ITimelineEventProvider
-from trac.util import as_bool, as_int, get_reporter_id
+from trac.util import as_bool, as_int, get_reporter_id, lazy
 from trac.util.datefmt import (
-    format_datetime, from_utimestamp, to_utimestamp, utc
+    datetime_now, format_datetime, from_utimestamp, to_utimestamp, utc
 )
+from trac.util.html import to_fragment
 from trac.util.text import (
-    exception_to_unicode, empty, obfuscate_email_address, shorten_line,
-    to_unicode
+    exception_to_unicode, empty, obfuscate_email_address, shorten_line
 )
 from trac.util.presentation import separated
-from trac.util.translation import _, tag_, tagn_, N_, gettext, ngettext
+from trac.util.translation import _, tag_, tagn_, N_, ngettext
 from trac.versioncontrol.diff import get_diff_options, diff_blocks
-from trac.web import (
-    IRequestHandler, RequestDone, arg_list_to_args, parse_arg_list
-)
+from trac.web.api import IRequestHandler, arg_list_to_args, parse_arg_list
 from trac.web.chrome import (
     Chrome, INavigationContributor, ITemplateProvider,
     add_ctxtnav, add_link, add_notice, add_script, add_script_data,
-    add_stylesheet, add_warning, auth_link, prevnext_nav, web_context
+    add_stylesheet, add_warning, auth_link, chrome_info_script, prevnext_nav,
+    web_context
 )
-from trac.wiki.formatter import format_to, format_to_html, format_to_oneliner
+from trac.wiki.formatter import format_to, format_to_html
 
 
 class InvalidTicket(TracError):
@@ -77,12 +75,14 @@ class TicketModule(Component):
         open / close operations (''since 0.9'').""")
 
     max_description_size = IntOption('ticket', 'max_description_size', 262144,
-        """Don't accept tickets with a too big description.
-        (''since 0.11'').""")
+        """Maximum allowed description size in characters.
+        (//since 0.11//).""")
 
     max_comment_size = IntOption('ticket', 'max_comment_size', 262144,
-        """Don't accept tickets with a too big comment.
-        (''since 0.11.2'')""")
+        """Maximum allowed comment size in characters. (//since 0.11.2//).""")
+
+    max_summary_size = IntOption('ticket', 'max_summary_size', 262144,
+        """Maximum allowed summary size in characters. (//since 1.0.2//).""")
 
     timeline_newticket_formatter = Option('timeline', 'newticket_formatter',
                                           'oneliner',
@@ -106,6 +106,8 @@ class TicketModule(Component):
             [TracQuery#UsingTracLinks Trac links].
             (''since 0.12'')""")
 
+    ticket_path_re = re.compile(r'/ticket/([0-9]+)$')
+
     def __init__(self):
         self._warn_for_default_attr = set()
 
@@ -123,11 +125,11 @@ class TicketModule(Component):
             return getattr(TicketSystem(self.env), name)
         raise AttributeError("TicketModule has no attribute '%s'" % name)
 
-    @property
+    @lazy
     def must_preserve_newlines(self):
         preserve_newlines = self.preserve_newlines
         if preserve_newlines == 'default':
-            preserve_newlines = self.env.get_version(initial=True) >= 21 # 0.11
+            preserve_newlines = self.env.database_initial_version >= 21 # 0.11
         return as_bool(preserve_newlines)
 
     # IContentConverter methods
@@ -147,14 +149,14 @@ class TicketModule(Component):
             return self.export_csv(req, ticket, sep='\t',
                                    mimetype='text/tab-separated-values')
         elif key == 'rss':
-            return self.export_rss(req, ticket)
+            return self._export_rss(req, ticket)
 
     # INavigationContributor methods
 
     def get_active_navigation_item(self, req):
-        if re.match(r'/newticket/?', req.path_info):
-            return 'newticket'
-        return 'tickets'
+        if self.ticket_path_re.match(req.path_info):
+            return 'tickets'
+        return 'newticket'
 
     def get_navigation_items(self, req):
         if 'TICKET_CREATE' in req.perm:
@@ -165,11 +167,11 @@ class TicketModule(Component):
     # IRequestHandler methods
 
     def match_request(self, req):
-        if req.path_info == "/newticket":
-            return True
-        match = re.match(r'/ticket/([0-9]+)$', req.path_info)
+        match = self.ticket_path_re.match(req.path_info)
         if match:
             req.args['id'] = match.group(1)
+            return True
+        if req.path_info == '/newticket':
             return True
 
     def process_request(self, req):
@@ -294,10 +296,12 @@ class TicketModule(Component):
                     SELECT t.id, tc.time, tc.author, t.type, t.summary,
                            tc.field, tc.oldvalue, tc.newvalue
                     FROM ticket_change tc
-                        INNER JOIN ticket t ON t.id = tc.ticket
-                            AND tc.time>=%s AND tc.time<=%s
-                    ORDER BY tc.time
-                    """ % (ts_start, ts_stop)):
+                    INNER JOIN ticket t ON
+                        t.id = tc.ticket AND tc.time>=%%s AND tc.time<=%%s
+                    LEFT OUTER JOIN enum p ON
+                        p.type='priority' AND p.name=t.priority
+                    ORDER BY tc.time, COALESCE(p.value,'')='', %s, tc.ticket
+                    """ % db.cast('p.value', 'int'), (ts_start, ts_stop)):
                 if not (oldvalue or newvalue):
                     # ignore empty change corresponding to custom field
                     # created (None -> '') or deleted ('' -> None)
@@ -307,7 +311,7 @@ class TicketModule(Component):
                         ev = produce_event(data, status, fields, comment,
                                            cid)
                         if ev:
-                             yield (ev, data[1])
+                            yield (ev, data[1])
                     status, fields, comment, cid = 'edit', {}, '', None
                     data = (id, t, author, type, summary, None)
                 if field == 'comment':
@@ -416,7 +420,6 @@ class TicketModule(Component):
     def _render_batched_timeline_event(self, context, field, event):
         tickets, verb, info, summary, status, resolution, type, \
                 description, comment, cid = event[3]
-        tickets = sorted(tickets)
         if field == 'url':
             return context.href.query(id=','.join(str(t) for t in tickets))
         elif field == 'title':
@@ -440,7 +443,7 @@ class TicketModule(Component):
                 yield controller
 
     def _process_newticket_request(self, req):
-        req.perm.require('TICKET_CREATE')
+        req.perm('ticket').require('TICKET_CREATE')
         ticket = Ticket(self.env)
 
         plain_fields = True # support for /newticket?version=0.11 GETs
@@ -503,6 +506,7 @@ class TicketModule(Component):
 
         if req.get_header('X-Requested-With') == 'XMLHttpRequest':
             data['preview_mode'] = True
+            data['chrome_info_script'] = chrome_info_script
             return 'ticket_box.html', data, None
 
         add_stylesheet(req, 'common/css/ticket.css')
@@ -521,7 +525,8 @@ class TicketModule(Component):
             escape_newlines = self.must_preserve_newlines
             rendered = format_to_html(self.env, context,
                                       req.args.get('edited_comment', ''),
-                                      escape_newlines=escape_newlines)
+                                      escape_newlines=escape_newlines) + \
+                       chrome_info_script(req)
             req.send(rendered.encode('utf-8'))
 
         req.perm('ticket', id, version).require('TICKET_VIEW')
@@ -543,10 +548,14 @@ class TicketModule(Component):
             elif action == 'diff':
                 return self._render_diff(req, ticket, data, text_fields)
         elif action == 'comment-history':
-            cnum = int(req.args['cnum'])
+            cnum = as_int(req.args.get('cnum'), None)
+            if cnum is None:
+                raise TracError(_("Invalid request arguments."))
             return self._render_comment_history(req, ticket, data, cnum)
         elif action == 'comment-diff':
-            cnum = int(req.args['cnum'])
+            cnum = as_int(req.args.get('cnum'), None)
+            if cnum is None:
+                raise TracError(_("Invalid request arguments."))
             return self._render_comment_diff(req, ticket, data, cnum)
         elif 'preview_comment' in req.args:
             field_changes = {}
@@ -643,6 +652,7 @@ class TicketModule(Component):
 
         if xhr:
             data['preview_mode'] = bool(data['change_preview']['fields'])
+            data['chrome_info_script'] = chrome_info_script
             return 'ticket_preview.html', data, None
 
         mime = Mimeview(self.env)
@@ -754,7 +764,7 @@ class TicketModule(Component):
                 remove.append(entry)
             else:
                 add.append(entry)
-        action = entry = ''
+        action = entry = None
         if remove:
             action, entry = ('remove', remove[0])
         elif add:
@@ -823,8 +833,8 @@ class TicketModule(Component):
         `text_fields` is optionally a list of fields of interest, that are
         considered for jumping to the next change.
         """
-        new_version = int(req.args.get('version', 1))
-        old_version = int(req.args.get('old_version', new_version))
+        new_version = as_int(req.args.get('version'), 1)
+        old_version = as_int(req.args.get('old_version'), new_version)
         if old_version > new_version:
             old_version, new_version = new_version, old_version
 
@@ -989,7 +999,8 @@ class TicketModule(Component):
 
     def _get_comment_history(self, req, ticket, cnum):
         history = []
-        for version, date, author, comment in ticket.get_comment_history(cnum):
+        for version, date, author, comment in \
+                ticket.get_comment_history(cnum) or []:
             history.append({
                 'version': version, 'date': date, 'author': author,
                 'comment': _("''Initial version''") if version == 0 else '',
@@ -1019,8 +1030,8 @@ class TicketModule(Component):
     def _render_comment_diff(self, req, ticket, data, cnum):
         """Show differences between two versions of a ticket comment."""
         req.perm(ticket.resource).require('TICKET_VIEW')
-        new_version = int(req.args.get('version', 1))
-        old_version = int(req.args.get('old_version', new_version))
+        new_version = as_int(req.args.get('version'), 1)
+        old_version = as_int(req.args.get('old_version'), new_version)
         if old_version > new_version:
             old_version, new_version = new_version, old_version
         elif old_version == new_version:
@@ -1130,7 +1141,7 @@ class TicketModule(Component):
         for f in fields:
             name = f['name']
             value = ticket.values.get(name, '')
-            if name in ('cc', 'reporter'):
+            if name in ('cc', 'owner', 'reporter'):
                 value = Chrome(self.env).format_emails(context, value, ' ')
             elif name in ticket.time_fields:
                 value = format_datetime(value, '%Y-%m-%d %H:%M:%S',
@@ -1140,6 +1151,13 @@ class TicketModule(Component):
         return (content.getvalue(), '%s;charset=utf-8' % mimetype)
 
     def export_rss(self, req, ticket):
+        """:deprecated: since 1.0.6, use `_export_rss` instead. Will be
+                        removed in 1.3.1.
+        """
+        content, content_type = self._export_rss(req, ticket)
+        return ''.join(content), content_type
+
+    def _export_rss(self, req, ticket):
         changes = []
         change_summary = {}
 
@@ -1177,7 +1195,8 @@ class TicketModule(Component):
         data = self._prepare_data(req, ticket, absurls=True)
         data['changes'] = changes
         output = Chrome(self.env).render_template(req, 'ticket.rss', data,
-                                                  'application/rss+xml')
+                                                  'application/rss+xml',
+                                                  iterable=True)
         return output, 'application/rss+xml'
 
     # Ticket validation and changes
@@ -1241,8 +1260,9 @@ class TicketModule(Component):
                 value = ticket[name]
                 if value:
                     if value not in field['options']:
-                        add_warning(req, '"%s" is not a valid value for '
-                                    'the %s field.' % (value, name))
+                        add_warning(req, _('"%(value)s" is not a valid value '
+                                           'for the %(name)s field.',
+                                           value=value, name=name))
                         valid = False
                 elif not field.get('optional', False):
                     add_warning(req, _("field %(name)s must be set",
@@ -1263,6 +1283,13 @@ class TicketModule(Component):
                                num=self.max_comment_size))
             valid = False
 
+        # Validate summary length
+        if len(ticket['summary'] or '') > self.max_summary_size:
+            add_warning(req, _("Ticket summary is too long (must be less "
+                               "than %(num)s characters)",
+                               num=self.max_summary_size))
+            valid = False
+
         # Validate comment numbering
         try:
             # replyto must be 'description' or a number
@@ -1278,9 +1305,9 @@ class TicketModule(Component):
             for field, message in manipulator.validate_ticket(req, ticket):
                 valid = False
                 if field:
-                    add_warning(req, _("The ticket field '%(field)s' is "
-                                       "invalid: %(message)s",
-                                       field=field, message=message))
+                    add_warning(req, tag_("The ticket field '%(field)s'"
+                                          " is invalid: %(message)s",
+                                          field=field, message=message))
                 else:
                     add_warning(req, message)
         return valid
@@ -1289,15 +1316,15 @@ class TicketModule(Component):
         ticket.insert()
 
         # Notify
+        tn = TicketNotifyEmail(self.env)
         try:
-            tn = TicketNotifyEmail(self.env)
             tn.notify(ticket, newticket=True)
         except Exception, e:
             self.log.error("Failure sending notification on creation of "
                     "ticket #%s: %s", ticket.id, exception_to_unicode(e))
-            add_warning(req, _("The ticket has been created, but an error "
-                               "occurred while sending notifications: "
-                               "%(message)s", message=to_unicode(e)))
+            add_warning(req, tag_("The ticket has been created, but an error "
+                                  "occurred while sending notifications: "
+                                  "%(message)s", message=to_fragment(e)))
 
         # Redirect the user to the newly created ticket or add attachment
         ticketref=tag.a('#', ticket.id, href=req.href.ticket(ticket.id))
@@ -1322,14 +1349,14 @@ class TicketModule(Component):
         # -- Save changes
 
         fragment = ''
-        now = datetime.now(utc)
+        now = datetime_now(utc)
         cnum = ticket.save_changes(get_reporter_id(req, 'author'),
                                    req.args.get('comment'), when=now,
                                    replyto=req.args.get('replyto'))
         if cnum:
             fragment = '#comment:%d' % cnum
+            tn = TicketNotifyEmail(self.env)
             try:
-                tn = TicketNotifyEmail(self.env)
                 tn.notify(ticket, newticket=False, modtime=now)
             except Exception, e:
                 self.log.error("Failure sending notification on change to "
@@ -1341,12 +1368,12 @@ class TicketModule(Component):
                 add_warning(req, tag_("The %(change)s has been saved, but an "
                                       "error occurred while sending "
                                       "notifications: %(message)s",
-                                      change=change, message=to_unicode(e)))
+                                      change=change, message=to_fragment(e)))
                 fragment = ''
 
         # After saving the changes, apply the side-effects.
         for controller in controllers:
-            self.log.debug("Side effect for %s" %
+            self.log.debug("Side effect for %s",
                            controller.__class__.__name__)
             controller.apply_action_side_effects(req, ticket, action)
 
@@ -1401,6 +1428,9 @@ class TicketModule(Component):
 
     def _query_link(self, req, name, value, text=None):
         """Return a link to /query with the appropriate name and value"""
+        from trac.ticket.query import QueryModule
+        if not self.env.is_component_enabled(QueryModule):
+            return text or value
         default_query = self.ticketlink_query.lstrip('?')
         args = arg_list_to_args(parse_arg_list(default_query))
         args[name] = value
@@ -1410,7 +1440,9 @@ class TicketModule(Component):
 
     def _query_link_words(self, context, name, value):
         """Splits a list of words and makes a query link to each separately"""
-        if not isinstance(value, basestring): # None or other non-splitable
+        from trac.ticket.query import QueryModule
+        if not (isinstance(value, basestring) and  # None or other non-splitable
+                self.env.is_component_enabled(QueryModule)):
             return value
         default_query = self.ticketlink_query.startswith('?') and \
                         self.ticketlink_query[1:] or self.ticketlink_query
@@ -1439,6 +1471,12 @@ class TicketModule(Component):
             name = field['name']
             type_ = field['type']
 
+            # ensure sane defaults
+            field.setdefault('optional', False)
+            field.setdefault('options', [])
+            field.setdefault('skip', False)
+            field.setdefault('editable', True)
+
             # enable a link to custom query for all choice fields
             if type_ not in ['text', 'textarea']:
                 field['rendered'] = self._query_link(req, name, ticket[name])
@@ -1456,11 +1494,12 @@ class TicketModule(Component):
                     if 'TICKET_MODIFY' in req.perm(ticket.resource):
                         field['skip'] = False
                         owner_field = field
-            elif name == 'milestone':
+            elif name == 'milestone' and not field.get('custom'):
                 milestones = [Milestone(self.env, opt)
                               for opt in field['options']]
                 milestones = [m for m in milestones
                               if 'MILESTONE_VIEW' in req.perm(m.resource)]
+                field['editable'] = milestones != []
                 groups = group_milestones(milestones, ticket.exists
                     and 'TICKET_ADMIN' in req.perm(ticket.resource))
                 field['options'] = []
@@ -1481,9 +1520,10 @@ class TicketModule(Component):
                     field['edit_label'] = {
                             'add': _("Add to Cc"),
                             'remove': _("Remove from Cc"),
-                            '': _("Add/Remove from Cc")}[cc_action]
-                    field['cc_entry'] = cc_entry or _("<Author field>")
-                    field['cc_update'] = cc_update or None
+                            None: _("Cc")}[cc_action]
+                    field['cc_action'] = cc_action
+                    field['cc_entry'] = cc_entry
+                    field['cc_update'] = cc_update
                     if cc_changed:
                         field_changes['cc']['cc_update'] = cc_update
                 if cc_changed:
@@ -1499,7 +1539,7 @@ class TicketModule(Component):
 
             # per type settings
             if type_ in ('radio', 'select'):
-                if ticket.exists:
+                if ticket.exists and field['editable']:
                     value = ticket.values.get(name)
                     options = field['options']
                     optgroups = []
@@ -1517,25 +1557,13 @@ class TicketModule(Component):
                     field['rendered'] = self._query_link(req, name, value,
                                 _("yes") if value == '1' else _("no"))
             elif type_ == 'text':
-                if field.get('format') == 'wiki':
-                    field['rendered'] = format_to_oneliner(self.env, context,
-                                                           ticket[name])
-                elif field.get('format') == 'reference':
+                if field.get('format') == 'reference':
                     field['rendered'] = self._query_link(req, name,
                                                          ticket[name])
                 elif field.get('format') == 'list':
                     field['rendered'] = self._query_link_words(context, name,
                                                                ticket[name])
-            elif type_ == 'textarea':
-                if field.get('format') == 'wiki':
-                    field['rendered'] = \
-                        format_to_html(self.env, context, ticket[name],
-                                escape_newlines=self.must_preserve_newlines)
 
-            # ensure sane defaults
-            field.setdefault('optional', False)
-            field.setdefault('options', [])
-            field.setdefault('skip', False)
             fields.append(field)
 
         # Move owner field to end when shown

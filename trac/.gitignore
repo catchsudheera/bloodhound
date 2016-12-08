@@ -5,10 +5,11 @@
 build
 dist
 Trac.egg-info
-*.pyc
+*.py[co]
 testenv
 testing.log
 functional-testing.log
+trac/test.db
 html
 htmlcov
 figleaf
@@ -19,6 +20,7 @@ Makefile.cfg
 doc/.build
 *.mo
 trac/htdocs/js/messages/*.js
+.idea
 .project
 .pydevproject
 .settings

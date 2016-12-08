@@ -84,8 +84,8 @@ def load_py_files():
             for plugin_file in plugin_files:
                 try:
                     plugin_name = os.path.basename(plugin_file[:-3])
-                    env.log.debug('Loading file plugin %s from %s' % \
-                                  (plugin_name, plugin_file))
+                    env.log.debug('Loading file plugin %s from %s',
+                                  plugin_name, plugin_file)
                     if plugin_name not in sys.modules:
                         module = imp.load_source(plugin_name, plugin_file)
                     if path == auto_enable:
@@ -97,15 +97,19 @@ def load_py_files():
 
     return _load_py_files
 
+
 def get_plugins_dir(env):
-    """Return the path to the `plugins` directory of the environment."""
-    plugins_dir = os.path.realpath(os.path.join(env.path, 'plugins'))
-    return os.path.normcase(plugins_dir)
+    """Return the path to the `plugins` directory of the environment.
+
+    :since 1.0.11: Deprecated and will be removed in 1.3.1. Use the
+                   Environment.plugins_dir property instead."""
+    return env.plugins_dir
+
 
 def load_components(env, extra_path=None, loaders=(load_eggs('trac.plugins'),
                                                    load_py_files())):
     """Load all plugin components found on the given search path."""
-    plugins_dir = get_plugins_dir(env)
+    plugins_dir = env.plugins_dir
     search_path = [plugins_dir]
     if extra_path:
         search_path += list(extra_path)
@@ -134,7 +138,7 @@ def get_plugin_info(env, include_core=False):
                                               location=module.__file__)
         return dist
 
-    plugins_dir = get_plugins_dir(env)
+    plugins_dir = env.plugins_dir
     plugins = {}
     from trac.core import ComponentMeta
     for component in ComponentMeta._components:
@@ -182,7 +186,10 @@ def get_plugin_info(env, include_core=False):
                 version = (getattr(module, 'version', '') or
                            getattr(module, 'revision', ''))
                 # special handling for "$Rev$" strings
-                version = version.replace('$', '').replace('Rev: ', 'r')
+                if version != '$Rev$':
+                    version = version.replace('$', '').replace('Rev: ', 'r')
+                else:  # keyword hasn't been expanded
+                    version = ''
             plugins[dist.project_name] = {
                 'name': dist.project_name, 'version': version,
                 'path': dist.location, 'plugin_filename': plugin_filename,
@@ -239,7 +246,7 @@ def match_plugins_to_frames(plugins, frames):
                 pass    # Metadata not found
 
     for plugin in plugins:
-        base, ext = os.path.splitext(plugin['path'])
+        base, ext = os.path.splitext(plugin['path'].replace('\\', '/'))
         if ext == '.egg' and egg_frames:
             find_egg_frame_index(plugin)
         else:

@@ -1,3 +1,16 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2005-2013 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
+
 from __future__ import with_statement
 
 from Cookie import SimpleCookie as Cookie
@@ -5,10 +18,12 @@ import time
 from datetime import datetime
 import unittest
 
+import trac.tests.compat
 from trac.test import EnvironmentStub, Mock
 from trac.web.session import DetachedSession, Session, PURGE_AGE, \
                              UPDATE_INTERVAL, SessionAdmin
 from trac.core import TracError
+from trac.util.datefmt import time_now
 
 
 def _prep_session_table(env, spread_visits=False):
@@ -88,10 +103,10 @@ class SessionTestCase(unittest.TestCase):
         req = Mock(authname='anonymous', base_path='/', incookie=incookie,
                    outcookie=outcookie)
         session = Session(self.env, req)
-        self.assertEquals('123456', session.sid)
-        self.failIf(outcookie.has_key('trac_session'))
+        self.assertEqual('123456', session.sid)
+        self.assertNotIn('trac_session', outcookie)
 
-    def test_authenticated_session(self):
+    def _test_authenticated_session(self, username):
         """
         Verifies that a session cookie does not get used if the user is logged
         in, and that Trac expires the cookie.
@@ -99,15 +114,21 @@ class SessionTestCase(unittest.TestCase):
         incookie = Cookie()
         incookie['trac_session'] = '123456'
         outcookie = Cookie()
-        req = Mock(authname='john', base_path='/', incookie=incookie,
+        req = Mock(authname=username, base_path='/', incookie=incookie,
                    outcookie=outcookie)
         session = Session(self.env, req)
-        self.assertEqual('john', session.sid)
+        self.assertEqual(username, session.sid)
         session['foo'] = 'bar'
         session.save()
-        self.assertEquals(0, outcookie['trac_session']['expires'])
+        self.assertEqual(0, outcookie['trac_session']['expires'])
 
-    def test_session_promotion(self):
+    def test_authenticated_session(self):
+        self._test_authenticated_session('john')
+        self._test_authenticated_session('j.smith')
+        self._test_authenticated_session(u'Jöhn')  # non-ascii username
+        self._test_authenticated_session('john@EXAMPLE.LOCAL')  # LDAP username
+
+    def _test_session_promotion(self, username):
         """
         Verifies that an existing anonymous session gets promoted to an
         authenticated session when the user logs in.
@@ -117,33 +138,57 @@ class SessionTestCase(unittest.TestCase):
             incookie = Cookie()
             incookie['trac_session'] = '123456'
             outcookie = Cookie()
-            req = Mock(authname='john', base_path='/', incookie=incookie,
+            req = Mock(authname=username, base_path='/', incookie=incookie,
                        outcookie=outcookie)
             session = Session(self.env, req)
-            self.assertEqual('john', session.sid)
+            self.assertEqual(username, session.sid)
             session.save()
 
-        self.assertEqual([('john', 1)], self.env.db_query(
-            "SELECT sid, authenticated FROM session"))
+        self.assertEqual([(username, 1)],
+            self.env.db_query("""SELECT sid, authenticated FROM session
+                                 WHERE sid=%s""", (username,)))
 
-    def test_new_session_promotion(self):
+    def test_session_promotion(self):
+        self._test_session_promotion('john')
+        self._test_session_promotion('j.smith')
+        self._test_session_promotion(u'Jöhn')  # non-ascii username
+        self._test_session_promotion('john@EXAMPLE.LOCAL')  # LDAP username
+
+        sessions = self.env.db_query("SELECT sid, authenticated FROM session")
+        self.assertEqual(set([('john', 1), ('j.smith', 1), (u'Jöhn', 1),
+                              ('john@EXAMPLE.LOCAL', 1)]),
+                         set(sessions))
+
+    def _test_new_session_promotion(self, username):
         """
         Verifies that even without a preexisting anonymous session,
         an authenticated session will be created when the user logs in.
         (same test as above without the initial INSERT)
         """
-        with self.env.db_transaction as db:
+        with self.env.db_transaction:
             incookie = Cookie()
             incookie['trac_session'] = '123456'
             outcookie = Cookie()
-            req = Mock(authname='john', base_path='/', incookie=incookie,
+            req = Mock(authname=username, base_path='/', incookie=incookie,
                        outcookie=outcookie)
             session = Session(self.env, req)
-            self.assertEqual('john', session.sid)
+            self.assertEqual(username, session.sid)
             session.save()
 
-        self.assertEqual([('john', 1)], self.env.db_query(
-                "SELECT sid, authenticated FROM session"))
+        self.assertEqual([(username, 1)],
+            self.env.db_query("""SELECT sid, authenticated FROM session
+                                 WHERE sid=%s""", (username,)))
+
+    def test_new_session_promotion(self):
+        self._test_new_session_promotion('john')
+        self._test_new_session_promotion('j.smith')
+        self._test_new_session_promotion(u'Jöhn')  # non-ascii username
+        self._test_new_session_promotion('john@EXAMPLE.LOCAL')  # LDAP username
+
+        sessions = self.env.db_query("SELECT sid, authenticated FROM session")
+        self.assertEqual(set([('john', 1), ('j.smith', 1), (u'Jöhn', 1),
+                              ('john@EXAMPLE.LOCAL', 1)]),
+                         set(sessions))
 
     def test_add_anonymous_session_var(self):
         """
@@ -216,7 +261,7 @@ class SessionTestCase(unittest.TestCase):
         with self.env.db_transaction as db:
             db("INSERT INTO session VALUES ('123456', 0, %s)", (0,))
             db("INSERT INTO session VALUES ('987654', 0, %s)",
-               (int(time.time() - PURGE_AGE - 3600),))
+               (int(time_now() - PURGE_AGE - 3600),))
             db("""
                 INSERT INTO session_attribute
                 VALUES ('987654', 0, 'foo', 'bar')
@@ -240,7 +285,7 @@ class SessionTestCase(unittest.TestCase):
         Verify that a session gets deleted when it doesn't have any data except
         for the 'last_visit' timestamp.
         """
-        now = time.time()
+        now = time_now()
 
         # Make sure the session has data so that it doesn't get dropped
         with self.env.db_transaction as db:
@@ -351,7 +396,7 @@ class SessionTestCase(unittest.TestCase):
         req = Mock(authname='anonymous', base_path='/', incookie=incookie,
                    outcookie=Cookie())
         session = Session(self.env, req)
-        self.assert_('foo' not in session)
+        self.assertTrue('foo' not in session)
         session['foo'] = 'baz'
         session.save()
 
@@ -393,7 +438,7 @@ class SessionTestCase(unittest.TestCase):
         Verify that accessing a session after one day updates the sessions
         'last_visit' variable so that the session doesn't get purged.
         """
-        now = time.time()
+        now = time_now()
 
         # Make sure the session has data so that it doesn't get dropped
         with self.env.db_transaction as db:
@@ -570,10 +615,46 @@ class SessionTestCase(unittest.TestCase):
         result = get_session_info(self.env, anon_list[1][0])
         self.assertEqual(result, ('name11', 'val11', 'val11'))
 
+    def test_session_get_session_with_invalid_sid(self):
+        cookie = Cookie()
+        req = Mock(incookie=Cookie(), outcookie=cookie, authname='anonymous',
+                   base_path='/')
+        session = Session(self.env, req)
+        session.get_session('0123456789')
+        self.assertEqual('0123456789', session.sid)
+        session.get_session('abcxyz')
+        self.assertEqual('abcxyz', session.sid)
+        session.get_session('abc123xyz')
+        self.assertEqual('abc123xyz', session.sid)
+        self.assertRaises(TracError, session.get_session, 'abc 123 xyz')
+        self.assertRaises(TracError, session.get_session, 'abc-123-xyz')
+        self.assertRaises(TracError, session.get_session, 'abc<i>123</i>xyz')
+        self.assertRaises(TracError, session.get_session, u'abc123xÿz')
+        self.assertRaises(TracError, session.get_session,
+                          u'abc¹₂³xyz')  # Unicode digits
+
+    def test_session_change_id_with_invalid_sid(self):
+        cookie = Cookie()
+        req = Mock(incookie=Cookie(), outcookie=cookie, authname='anonymous',
+                   base_path='/')
+        session = Session(self.env, req)
+        session.change_sid('0123456789')
+        self.assertEqual('0123456789', session.sid)
+        session.change_sid('abcxyz')
+        self.assertEqual('abcxyz', session.sid)
+        session.change_sid('abc123xyz')
+        self.assertEqual('abc123xyz', session.sid)
+        self.assertRaises(TracError, session.change_sid, 'abc 123 xyz')
+        self.assertRaises(TracError, session.change_sid, 'abc-123-xyz')
+        self.assertRaises(TracError, session.change_sid, 'abc<i>123</i>xyz')
+        self.assertRaises(TracError, session.change_sid, u'abc123xÿz')
+        self.assertRaises(TracError, session.change_sid,
+                          u'abc¹₂³xyz')  # Unicode digits
+
 
 def suite():
-    return unittest.makeSuite(SessionTestCase, 'test')
+    return unittest.makeSuite(SessionTestCase)
 
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(defaultTest='suite')

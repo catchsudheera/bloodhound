@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2004-2010 Edgewall Software
+# Copyright (C) 2004-2014 Edgewall Software
 # Copyright (C) 2004 Daniel Lundin <daniel@edgewall.com>
 # Copyright (C) 2005-2006 Christopher Lenz <cmlenz@gmx.de>
 # Copyright (C) 2006-2007 Christian Boos <cboos@edgewall.org>
@@ -68,7 +68,8 @@ from genshi.builder import Fragment, tag
 from genshi.input import HTMLParser
 
 from trac.config import IntOption, ListOption, Option
-from trac.core import *
+from trac.core import Component, ExtensionPoint, Interface, TracError, \
+                      implements
 from trac.resource import Resource
 from trac.util import Ranges, content_disposition
 from trac.util.text import exception_to_unicode, to_utf8, to_unicode
@@ -77,6 +78,7 @@ from trac.util.translation import _, tag_
 
 __all__ = ['Context', 'Mimeview', 'RenderingContext', 'get_mimetype',
            'is_binary', 'detect_unicode', 'content_to_unicode', 'ct_mimetype']
+
 
 class RenderingContext(object):
     """
@@ -107,7 +109,7 @@ class RenderingContext(object):
     set up nested contexts for each matching ticket that will be used for
     rendering the ticket descriptions.
 
-    :since: version 0.11
+    :since: version 1.0
     """
 
     def __init__(self, resource, href=None, perm=None):
@@ -123,7 +125,7 @@ class RenderingContext(object):
         to the given `resource` so that fine-grained permission checks will
         apply to that.
         """
-        self.parent = None #: The parent context, if any
+        self.parent = None  #: The parent context, if any
         self.resource = resource
         self.href = href
         self.perm = perm(resource) if perm and resource else perm
@@ -131,7 +133,9 @@ class RenderingContext(object):
 
     @staticmethod
     def from_request(*args, **kwargs):
-        """:deprecated: since 1.0, use `web_context` instead."""
+        """:deprecated: since 1.0, use `web_context` instead. Will be removed
+                        in release 1.3.1.
+        """
         from trac.web.chrome import web_context
         return web_context(*args, **kwargs)
 
@@ -139,7 +143,7 @@ class RenderingContext(object):
         path = []
         context = self
         while context:
-            if context.resource.realm: # skip toplevel resource
+            if context.resource.realm:  # skip toplevel resource
                 path.append(repr(context.resource))
             context = context.parent
         return '<%s %s>' % (type(self).__name__, ' - '.join(reversed(path)))
@@ -211,7 +215,7 @@ class RenderingContext(object):
     # The keys are strings, but the values could be anything.
     #
     # In nested contexts, the hints are inherited from their parent context,
-    # unless overriden locally.
+    # unless overridden locally.
 
     def set_hints(self, **keyvalues):
         """Set rendering hints for this rendering context.
@@ -279,63 +283,71 @@ class RenderingContext(object):
 
 
 class Context(RenderingContext):
-    """:deprecated: old name kept for compatibility, use `RenderingContext`."""
+    """
+    :deprecated: since 1.0, use `RenderingContext` instead. `Context` is
+                 kept for compatibility and will be removed release 1.3.1.
+    """
 
 
 # Some common MIME types and their associated keywords and/or file extensions
 
 KNOWN_MIME_TYPES = {
-    'application/javascript': 'js',
-    'application/msword':     'doc dot',
-    'application/pdf':        'pdf',
-    'application/postscript': 'ps',
-    'application/rtf':        'rtf',
-    'application/x-sh':       'sh',
-    'application/x-csh':      'csh',
-    'application/x-troff':    'nroff roff troff',
-    'application/x-yaml':     'yml yaml',
+    'application/javascript':  'js',
+    'application/msword':      'doc dot',
+    'application/pdf':         'pdf',
+    'application/postscript':  'ps',
+    'application/rtf':         'rtf',
+    'application/x-dos-batch': 'bat batch cmd dos',
+    'application/x-sh':        'sh',
+    'application/x-csh':       'csh',
+    'application/x-genshi':    'genshi',
+    'application/x-troff':     'nroff roff troff',
+    'application/x-yaml':      'yml yaml',
 
-    'application/rss+xml':    'rss',
-    'application/xsl+xml':    'xsl',
-    'application/xslt+xml':   'xslt',
+    'application/rss+xml':     'rss',
+    'application/xsl+xml':     'xsl',
+    'application/xslt+xml':    'xslt',
 
-    'image/x-icon':           'ico',
-    'image/svg+xml':          'svg',
+    'image/x-icon':            'ico',
+    'image/svg+xml':           'svg',
 
-    'model/vrml':             'vrml wrl',
+    'model/vrml':              'vrml wrl',
 
-    'text/css':               'css',
-    'text/html':              'html htm',
-    'text/plain':             'txt TXT text README INSTALL '
-                              'AUTHORS COPYING ChangeLog RELEASE',
-    'text/xml':               'xml',
+    'text/css':                'css',
+    'text/html':               'html htm',
+    'text/plain':              'txt TXT text README INSTALL '
+                               'AUTHORS COPYING ChangeLog RELEASE',
+    'text/xml':                'xml',
 
     # see also TEXT_X_TYPES below
-    'text/x-csrc':            'c xs',
-    'text/x-chdr':            'h',
-    'text/x-c++src':          'cc CC cpp C c++ C++',
-    'text/x-c++hdr':          'hh HH hpp H',
-    'text/x-csharp':          'cs c# C#',
-    'text/x-diff':            'patch',
-    'text/x-eiffel':          'e',
-    'text/x-elisp':           'el',
-    'text/x-fortran':         'f',
-    'text/x-haskell':         'hs',
-    'text/x-ini':             'ini cfg',
-    'text/x-objc':            'm mm',
-    'text/x-ocaml':           'ml mli',
-    'text/x-makefile':        'make mk Makefile GNUMakefile',
-    'text/x-pascal':          'pas',
-    'text/x-perl':            'pl pm PL',
-    'text/x-php':             'php3 php4',
-    'text/x-python':          'py',
-    'text/x-pyrex':           'pyx',
-    'text/x-ruby':            'rb',
-    'text/x-scheme':          'scm',
-    'text/x-textile':         'txtl',
-    'text/x-vba':             'vb vba bas',
-    'text/x-verilog':         'v',
-    'text/x-vhdl':            'vhd',
+    'text/x-apacheconf':       'apache',
+    'text/x-csrc':             'c xs',
+    'text/x-chdr':             'h',
+    'text/x-c++src':           'cc CC cpp C c++ C++',
+    'text/x-c++hdr':           'hh HH hpp H',
+    'text/x-csharp':           'cs c# C#',
+    'text/x-diff':             'patch',
+    'text/x-eiffel':           'e',
+    'text/x-elisp':            'el',
+    'text/x-fortran':          'f',
+    'text/x-haskell':          'hs',
+    'text/x-ini':              'ini cfg',
+    'text/x-nginx-conf':       'nginx',
+    'text/x-objc':             'm mm',
+    'text/x-ocaml':            'ml mli',
+    'text/x-makefile':         'make mk Makefile GNUMakefile',
+    'text/x-pascal':           'pas',
+    'text/x-perl':             'pl pm PL',
+    'text/x-php':              'php3 php4',
+    'text/x-python':           'py',
+    'text/x-python-doctest':   'pycon',
+    'text/x-pyrex':            'pyx',
+    'text/x-ruby':             'rb',
+    'text/x-scheme':           'scm',
+    'text/x-textile':          'txtl',
+    'text/x-vba':              'vb vba bas',
+    'text/x-verilog':          'v',
+    'text/x-vhdl':             'vhd',
 }
 for t in KNOWN_MIME_TYPES.keys():
     types = KNOWN_MIME_TYPES[t].split()
@@ -367,6 +379,7 @@ MODE_RE = re.compile(r"""
     | -\*-\s*(?:mode:\s*)?([\w+-]+)\s*-\*-  # 3. look for Emacs' -*- mode -*-
     | vim:.*?(?:syntax|filetype|ft)=(\w+)   # 4. look for VIM's syntax=<n>
     """, re.VERBOSE)
+
 
 def get_mimetype(filename, content=None, mime_map=MIME_MAP,
                  mime_map_patterns={}):
@@ -407,9 +420,11 @@ def get_mimetype(filename, content=None, mime_map=MIME_MAP,
                     return 'application/octet-stream'
         return mimetype
 
+
 def ct_mimetype(content_type):
     """Return the mimetype part of a content type."""
     return (content_type or '').split(';')[0].strip()
+
 
 def is_binary(data):
     """Detect binary content by checking the first thousand bytes for zeroes.
@@ -419,6 +434,7 @@ def is_binary(data):
     if isinstance(data, str) and detect_unicode(data):
         return False
     return '\0' in data[:1000]
+
 
 def detect_unicode(data):
     """Detect different unicode charsets by looking for BOMs (Byte Order Mark).
@@ -433,6 +449,7 @@ def detect_unicode(data):
         return 'utf-8'
     else:
         return None
+
 
 def content_to_unicode(env, content, mimetype):
     """Retrieve an `unicode` object from a `content` to be previewed.
@@ -579,7 +596,10 @@ class IContentConverter(Interface):
     def convert_content(req, mimetype, content, key):
         """Convert the given content from mimetype to the output MIME type
         represented by key. Returns a tuple in the form (content,
-        output_mime_type) or None if conversion is not possible."""
+        output_mime_type) or None if conversion is not possible.
+
+        content must be a `str` instance or an iterable instance which
+        iterates `str` instances."""
 
 
 class Content(object):
@@ -624,18 +644,20 @@ class Mimeview(Component):
         doc="""List of additional MIME types and keyword mappings.
         Mappings are comma-separated, and for each MIME type,
         there's a colon (":") separated list of associated keywords
-        or file extensions. (''since 0.10'')""")
+        or file extensions. (''since 0.10'')
+        """)
 
     mime_map_patterns = ListOption('mimeviewer', 'mime_map_patterns',
         'text/plain:README|INSTALL|COPYING.*',
         doc="""List of additional MIME types associated to filename patterns.
         Mappings are comma-separated, and each mapping consists of a MIME type
         and a Python regexp used for matching filenames, separated by a colon
-        (":"). (''since 1.0'')""")
+        (":"). (''since 1.0'')
+        """)
 
     treat_as_binary = ListOption('mimeviewer', 'treat_as_binary',
         'application/octet-stream, application/pdf, application/postscript, '
-        'application/msword,application/rtf,',
+        'application/msword, application/rtf',
         doc="""Comma-separated list of MIME types that should be treated as
         binary data. (''since 0.11.5'')""")
 
@@ -659,12 +681,12 @@ class Mimeview(Component):
         return converters
 
     def convert_content(self, req, mimetype, content, key, filename=None,
-                        url=None):
+                        url=None, iterable=False):
         """Convert the given content to the target MIME type represented by
         `key`, which can be either a MIME type or a key. Returns a tuple of
         (content, output_mime_type, extension)."""
         if not content:
-            return ('', 'text/plain;charset=utf-8', '.txt')
+            return '', 'text/plain;charset=utf-8', '.txt'
 
         # Ensure we have a MIME type for this content
         full_mimetype = mimetype
@@ -673,9 +695,9 @@ class Mimeview(Component):
                 content = content.read(self.max_preview_size)
             full_mimetype = self.get_mimetype(filename, content)
         if full_mimetype:
-            mimetype = ct_mimetype(full_mimetype)   # split off charset
+            mimetype = ct_mimetype(full_mimetype)  # split off charset
         else:
-            mimetype = full_mimetype = 'text/plain' # fallback if not binary
+            mimetype = full_mimetype = 'text/plain'  # fallback if not binary
 
         # Choose best converter
         candidates = list(self.get_supported_conversions(mimetype) or [])
@@ -690,7 +712,14 @@ class Mimeview(Component):
                 converter in candidates:
             output = converter.convert_content(req, mimetype, content, ck)
             if output:
-                return (output[0], output[1], ext)
+                content, content_type = output
+                if iterable:
+                    if isinstance(content, basestring):
+                        content = (content,)
+                else:
+                    if not isinstance(content, basestring):
+                        content = ''.join(content)
+                return content, content_type, ext
         raise TracError(
             _("No available MIME conversions from %(old)s to %(new)s",
               old=mimetype, new=key))
@@ -751,7 +780,7 @@ class Mimeview(Component):
         expanded_content = None
         for qr, renderer in candidates:
             if force_source and not getattr(renderer, 'returns_source', False):
-                continue # skip non-source renderers in force_source mode
+                continue  # skip non-source renderers in force_source mode
             if isinstance(content, Content):
                 content.reset()
             try:
@@ -797,8 +826,8 @@ class Mimeview(Component):
                     return tag.div(class_='code')(tag.pre(result)).generate()
 
             except Exception, e:
-                self.log.warning('HTML preview using %s failed: %s',
-                                 renderer.__class__.__name__,
+                self.log.warning('HTML preview using %s with %r failed: %s',
+                                 renderer.__class__.__name__, context,
                                  exception_to_unicode(e, traceback=True))
                 if context.req and not context.get_hint('disable_warnings'):
                     from trac.web.chrome import add_warning
@@ -833,11 +862,11 @@ class Mimeview(Component):
             try:
                 data = (annotator, annotator.get_annotation_data(context))
             except TracError, e:
-                self.log.warning("Can't use annotator '%s': %s", a, e.message)
+                self.log.warning("Can't use annotator '%s': %s", a, e)
                 add_warning(context.req, tag.strong(
                     tag_("Can't use %(annotator)s annotator: %(error)s",
-                         annotator=tag.em(a), error=tag.pre(e.message))))
-                data = (None, None)
+                         annotator=tag.em(a), error=tag.pre(e))))
+                data = None, None
             annotator_datas.append(data)
 
         def _head_row():
@@ -866,7 +895,8 @@ class Mimeview(Component):
         )
 
     def get_max_preview_size(self):
-        """:deprecated: use `max_preview_size` attribute directly."""
+        """:deprecated: since 0.10, use `max_preview_size` attribute directly.
+        """
         return self.max_preview_size
 
     def get_charset(self, content='', mimetype=None):
@@ -1010,14 +1040,28 @@ class Mimeview(Component):
         """Helper method for converting `content` and sending it directly.
 
         `selector` can be either a key or a MIME Type."""
+        from trac.web.chrome import Chrome
         from trac.web.api import RequestDone
-        content, output_type, ext = self.convert_content(req, in_type,
-                                                         content, selector)
-        if isinstance(content, unicode):
-            content = content.encode('utf-8')
+        iterable = Chrome(self.env).use_chunked_encoding
+        content, output_type, ext = self.convert_content(req, in_type, content,
+                                                         selector,
+                                                         iterable=iterable)
+        if iterable:
+            def encoder(content):
+                for chunk in content:
+                    if isinstance(chunk, unicode):
+                        chunk = chunk.encode('utf-8')
+                    yield chunk
+            content = encoder(content)
+            length = None
+        else:
+            if isinstance(content, unicode):
+                content = content.encode('utf-8')
+            length = len(content)
         req.send_response(200)
         req.send_header('Content-Type', output_type)
-        req.send_header('Content-Length', len(content))
+        if length is not None:
+            req.send_header('Content-Length', length)
         if filename:
             req.send_header('Content-Disposition',
                             content_disposition('attachment',
@@ -1029,6 +1073,7 @@ class Mimeview(Component):
 
 def _group_lines(stream):
     space_re = re.compile('(?P<spaces> (?: +))|^(?P<tag><\w+.*?>)?( )')
+
     def pad_spaces(match):
         m = match.group('spaces')
         if m:
@@ -1108,7 +1153,7 @@ class LineNumberAnnotator(Component):
     """Text annotator that adds a column with line numbers."""
     implements(IHTMLPreviewAnnotator)
 
-    # ITextAnnotator methods
+    # IHTMLPreviewAnnotator methods
 
     def get_annotation_type(self):
         return 'lineno', _('Line'), _('Line numbers')

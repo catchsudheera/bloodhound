@@ -15,7 +15,6 @@
 from __future__ import with_statement
 
 import cmd
-import locale
 import os.path
 import pkg_resources
 from shlex import shlex
@@ -24,24 +23,26 @@ import sys
 import traceback
 
 from trac import __version__ as VERSION
-from trac.admin import AdminCommandError, AdminCommandManager
+from trac.admin.api import AdminCommandError, AdminCommandManager, \
+                           get_console_locale
 from trac.core import TracError
 from trac.env import Environment
 from trac.ticket.model import *
-from trac.util import translation
+from trac.util import translation, warn_setuptools_issue
 from trac.util.html import html
 from trac.util.text import console_print, exception_to_unicode, printout, \
                            printerr, raw_input, to_unicode, \
                            getpreferredencoding
-from trac.util.translation import _, ngettext, get_negotiated_locale, \
-                                  has_babel, cleandoc_
+from trac.util.translation import _, ngettext, has_babel, cleandoc_
 from trac.versioncontrol.api import RepositoryManager
 from trac.wiki.admin import WikiAdmin
+from trac.wiki.formatter import MacroError
 from trac.wiki.macros import WikiMacroBase
+
 
 TRAC_VERSION = pkg_resources.get_distribution('Trac').version
 rl_completion_suppress_append = None
-LANG = os.environ.get('LANG')
+
 
 def find_readline_lib():
     """Return the name (and possibly the full path) of the readline library
@@ -122,7 +123,8 @@ class TracAdmin(cmd.Cmd):
             printerr(exception_to_unicode(e))
             rv = 2
             if self.env_check():
-                self.env.log.error("Exception in trac-admin command: %s",
+                self.env.log.error("Exception in trac-admin command: %r%s",
+                                   line,
                                    exception_to_unicode(e, traceback=True))
         if not self.interactive:
             return rv
@@ -168,16 +170,20 @@ Type:  '?' or 'help' for help on commands.
 
     def _init_env(self):
         self.__env = env = Environment(self.envname)
+        negotiated = None
         # fixup language according to env settings
         if has_babel:
-            default = env.config.get('trac', 'default_language', '')
-            negotiated = get_negotiated_locale([LANG, default])
+            negotiated = get_console_locale(env)
             if negotiated:
                 translation.activate(negotiated)
 
     ##
     ## Utility methods
     ##
+
+    @property
+    def cmd_mgr(self):
+        return AdminCommandManager(self.env)
 
     def arg_tokenize(self, argstr):
         """`argstr` is an `unicode` string
@@ -240,9 +246,8 @@ Type:  '?' or 'help' for help on commands.
         if line and line[-1] == ' ':    # Space starts new argument
             args.append('')
         if self.env_check():
-            cmd_mgr = AdminCommandManager(self.env)
             try:
-                comp = cmd_mgr.complete_command(args, cmd_only)
+                comp = self.cmd_mgr.complete_command(args, cmd_only)
             except Exception, e:
                 printerr()
                 printerr(_('Completion error: %(err)s',
@@ -281,8 +286,7 @@ Type:  '?' or 'help' for help on commands.
             raise TracError(_('The Trac Environment needs to be upgraded.\n\n'
                               'Run "trac-admin %(path)s upgrade"',
                               path=self.envname))
-        cmd_mgr = AdminCommandManager(self.env)
-        return cmd_mgr.execute_command(*args)
+        return self.cmd_mgr.execute_command(*args)
 
     ##
     ## Available Commands
@@ -304,9 +308,10 @@ Type:  '?' or 'help' for help on commands.
     def do_help(self, line=None):
         arg = self.arg_tokenize(line)
         if arg[0]:
+            cmd_mgr = None
             doc = getattr(self, "_help_" + arg[0], None)
             if doc is None and self.env_check():
-                cmd_mgr = AdminCommandManager(self.env)
+                cmd_mgr = self.cmd_mgr
                 doc = cmd_mgr.get_command_help(arg)
             if doc:
                 self.print_doc(doc)
@@ -314,7 +319,9 @@ Type:  '?' or 'help' for help on commands.
                 printerr(_("No documentation found for '%(cmd)s'."
                            " Use 'help' to see the list of commands.",
                            cmd=' '.join(arg)))
-                cmds = cmd_mgr.get_similar_commands(arg[0])
+                cmds = None
+                if cmd_mgr:
+                    cmds = cmd_mgr.get_similar_commands(arg[0])
                 if cmds:
                     printout('')
                     printout(ngettext("Did you mean this?",
@@ -385,7 +392,7 @@ in order to initialize and prepare the project database.
         printout(_("""
  Please specify the connection string for the database to use.
  By default, a local SQLite database is created in the environment
- directory. It is also possible to use an already existing
+ directory. It is also possible to use an existing MySQL or
  PostgreSQL database (check the Trac documentation for the exact
  connection string syntax).
 """))
@@ -415,15 +422,11 @@ in order to initialize and prepare the project database.
 
         arg = self.arg_tokenize(line)
         inherit_paths = []
-        add_wiki = True
         i = 0
         while i < len(arg):
             item = arg[i]
             if item.startswith('--inherit='):
                 inherit_paths.append(arg.pop(i)[10:])
-            elif item.startswith('--nowiki'):
-                add_wiki = False
-                arg.pop(i)
             else:
                 i += 1
         arg = arg or [''] # Reset to usual empty in case we popped the only one
@@ -464,12 +467,11 @@ in order to initialize and prepare the project database.
                 traceback.print_exc()
                 sys.exit(1)
 
-            if add_wiki:
-                # Add a few default wiki pages
-                printout(_(" Installing default wiki pages"))
-                pages_dir = pkg_resources.resource_filename('trac.wiki',
-                                                            'default-pages')
-                WikiAdmin(self.__env).load_pages(pages_dir)
+            # Add a few default wiki pages
+            printout(_(" Installing default wiki pages"))
+            pages_dir = pkg_resources.resource_filename('trac.wiki',
+                                                        'default-pages')
+            WikiAdmin(self.__env).load_pages(pages_dir)
 
             if repository_dir:
                 try:
@@ -550,30 +552,31 @@ class TracAdminHelpMacro(WikiMacroBase):
                 cmd_mgr = AdminCommandManager(self.env)
                 doc = cmd_mgr.get_command_help(arg)
             if not doc:
-                raise TracError('Unknown trac-admin command "%s"' % content)
+                raise MacroError(_('Unknown trac-admin command '
+                                   '"%(command)s"', command=content))
         else:
             doc = TracAdmin.all_docs(self.env)
         buf = StringIO.StringIO()
         TracAdmin.print_doc(doc, buf, long=True)
-        return html.PRE(buf.getvalue(), class_='wiki')
+        return html.PRE(buf.getvalue().decode('utf-8'), class_='wiki')
 
 
-def run(args=None):
-    """Main entry point."""
+def _quote_args(args):
+    def quote(arg):
+        if arg.isalnum():
+            return arg
+        return '"\'"'.join("'%s'" % v for v in arg.split("'"))
+    return [quote(arg) for arg in args]
+
+
+def _run(args):
     if args is None:
         args = sys.argv[1:]
-    locale = None
-    if has_babel:
-        import babel
-        try:
-            locale = get_negotiated_locale([LANG]) or babel.Locale.default()
-        except babel.UnknownLocaleError:
-            pass
-        translation.activate(locale)
+    warn_setuptools_issue()
     admin = TracAdmin()
     if len(args) > 0:
         if args[0] in ('-h', '--help', 'help'):
-            return admin.onecmd(' '.join(['help'] + args[1:]))
+            return admin.onecmd(' '.join(_quote_args(['help'] + args[1:])))
         elif args[0] in ('-v','--version'):
             printout(os.path.basename(sys.argv[0]), TRAC_VERSION)
         else:
@@ -583,12 +586,10 @@ def run(args=None):
             except UnicodeDecodeError:
                 printerr(_("Non-ascii environment path '%(path)s' not "
                            "supported.", path=to_unicode(env_path)))
-                sys.exit(2)
+                return 2
             admin.env_set(env_path)
             if len(args) > 1:
-                s_args = ' '.join(["'%s'" % c for c in args[2:]])
-                command = args[1] + ' ' + s_args
-                return admin.onecmd(command)
+                return admin.onecmd(' '.join(_quote_args(args[1:])))
             else:
                 while True:
                     try:
@@ -597,6 +598,15 @@ def run(args=None):
                         admin.do_quit('')
     else:
         return admin.onecmd("help")
+
+
+def run(args=None):
+    """Main entry point."""
+    translation.activate(get_console_locale())
+    try:
+        return _run(args)
+    finally:
+        translation.deactivate()
 
 
 if __name__ == '__main__':

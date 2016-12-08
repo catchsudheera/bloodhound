@@ -1,3 +1,13 @@
+<!--!  Copyright (C) 2006-2016 Edgewall Software
+
+  This software is licensed as described in the file COPYING, which
+  you should have received as part of this distribution. The terms
+  are also available at http://trac.edgewall.com/license.html.
+
+  This software consists of voluntary contributions made by many
+  individuals. For the exact contribution history, see the revision
+  history and logs, available at http://trac.edgewall.org/.
+-->
 <!DOCTYPE html
     PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
     "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
@@ -12,7 +22,9 @@
     <script type="text/javascript">
       //<![CDATA[
       jQuery(document).ready(function ($) {
-        $("#systeminfo table").append("<tr><th>jQuery</th><td>"+$().jquery+"</td></tr>");
+        $("#systeminfo table").append("<tr><th>jQuery</th><td>"+$().jquery+"</td></tr>" +
+                                      "<tr><th>jQuery UI</th><td>"+$.ui.version+"</td></tr>" +
+                                      "<tr><th>jQuery Timepicker</th><td>"+$.timepicker.version+"</td></tr>");
       });
       //]]>
     </script>
@@ -43,7 +55,7 @@
       </a>
       <p i18n:msg="">Please visit the Trac open source project:
         <a href="http://trac.edgewall.org/">http://trac.edgewall.org/</a></p>
-      <p class="copyright" xml:lang="en" i18n:msg="">Copyright &copy; 2003-2013
+      <p class="copyright" xml:lang="en" i18n:msg="">Copyright &copy; 2003-2016
         <a href="http://www.edgewall.org/">Edgewall Software</a>
       </p>
 
@@ -78,6 +90,28 @@
                 <td class="file">$plugin.path</td>
               </tr>
             </tbody>
+          </table>
+        </div>
+
+        <div py:if="interface" id="interface">
+          <h2>Interface Customization</h2>
+          <table class="listing">
+            <tr>
+              <th class="section">Site templates</th>
+              <td class="file">${' '.join(interface['site-templates'])}</td>
+            </tr>
+            <tr>
+              <th class="section">Shared templates</th>
+              <td class="file">${' '.join(interface['shared-templates'])}</td>
+            </tr>
+            <tr>
+              <th class="section">Site static resources</th>
+              <td class="file">${' '.join(interface['site-htdocs'])}</td>
+            </tr>
+            <tr>
+              <th class="section">Shared static resources</th>
+              <td class="file">${' '.join(interface['shared-htdocs'])}</td>
+            </tr>
           </table>
         </div>
 

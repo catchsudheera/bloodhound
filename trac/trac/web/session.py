@@ -20,21 +20,22 @@
 
 from __future__ import with_statement
 
+import re
 import sys
-import time
 
-from trac.admin.api import console_date_format
+from trac.admin.api import console_date_format, get_console_locale
 from trac.core import TracError, Component, implements
 from trac.util import hex_entropy
 from trac.util.text import print_table
 from trac.util.translation import _
-from trac.util.datefmt import format_date, parse_date, to_datetime, \
-                              to_timestamp
+from trac.util.datefmt import get_datetime_format_hint, format_date, \
+                              parse_date, time_now, to_datetime, to_timestamp
 from trac.admin.api import IAdminCommandProvider, AdminCommandError
 
 UPDATE_INTERVAL = 3600 * 24 # Update session last_visit time stamp after 1 day
 PURGE_AGE = 3600 * 24 * 90 # Purge session after 90 days idle
 COOKIE_KEY = 'trac_session'
+
 
 # Note: as we often manipulate both the `session` and the
 #       `session_attribute` tables, there's a possibility of table
@@ -103,7 +104,7 @@ class DetachedSession(dict):
             return
 
         authenticated = int(self.authenticated)
-        now = int(time.time())
+        now = int(time_now())
 
         # We can't do the session management in one big transaction,
         # as the intertwined changes to both the session and
@@ -136,6 +137,9 @@ class DetachedSession(dict):
             # new ones. The last concurrent request to do so "wins".
 
             if self._old != self:
+                if self._old.get('name') != self.get('name') or \
+                        self._old.get('email') != self.get('email'):
+                    self.env.invalidate_known_users_cache()
                 if not items and not authenticated:
                     # No need to keep around empty unauthenticated sessions
                     db("DELETE FROM session WHERE sid=%s AND authenticated=0",
@@ -198,14 +202,14 @@ class Session(DetachedSession):
         super(Session, self).__init__(env, None)
         self.req = req
         if req.authname == 'anonymous':
-            if not req.incookie.has_key(COOKIE_KEY):
+            if COOKIE_KEY not in req.incookie:
                 self.sid = hex_entropy(24)
                 self.bake_cookie()
             else:
                 sid = req.incookie[COOKIE_KEY].value
                 self.get_session(sid)
         else:
-            if req.incookie.has_key(COOKIE_KEY):
+            if COOKIE_KEY in req.incookie:
                 sid = req.incookie[COOKIE_KEY].value
                 self.promote_session(sid)
             self.get_session(req.authname, authenticated=True)
@@ -220,14 +224,18 @@ class Session(DetachedSession):
         if sys.version_info >= (2, 6):
             self.req.outcookie[COOKIE_KEY]['httponly'] = True
 
+    _valid_sid_re = re.compile(r'[_A-Za-z0-9]+\Z')
+
     def get_session(self, sid, authenticated=False):
         refresh_cookie = False
 
+        if not authenticated and not self._valid_sid_re.match(sid):
+            raise TracError(_("Session ID must be alphanumeric."))
         if self.sid and sid != self.sid:
             refresh_cookie = True
 
         super(Session, self).get_session(sid, authenticated)
-        if self.last_visit and time.time() - self.last_visit > UPDATE_INTERVAL:
+        if self.last_visit and time_now() - self.last_visit > UPDATE_INTERVAL:
             refresh_cookie = True
 
         # Refresh the session cookie if this is the first visit after a day
@@ -240,6 +248,9 @@ class Session(DetachedSession):
         assert new_sid, 'Session ID cannot be empty'
         if new_sid == self.sid:
             return
+        if not self._valid_sid_re.match(new_sid):
+            raise TracError(_("Session ID must be alphanumeric."),
+                            _("Error renaming session"))
         with self.env.db_transaction as db:
             if db("SELECT sid FROM session WHERE sid=%s", (new_sid,)):
                 raise TracError(_("Session '%(id)s' already exists. "
@@ -296,7 +307,7 @@ class Session(DetachedSession):
                 try:
                     db("""INSERT INTO session (sid, last_visit, authenticated)
                           VALUES (%s, %s, 1)
-                          """, (self.req.authname, int(time.time())))
+                          """, (self.req.authname, int(time_now())))
                 except self.env.db_exc.IntegrityError:
                     self.env.log.warning('Authenticated session for %s '
                                          'already exists', self.req.authname)
@@ -313,6 +324,10 @@ class SessionAdmin(Component):
     implements(IAdminCommandProvider)
 
     def get_admin_commands(self):
+        hints = {
+           'datetime': get_datetime_format_hint(get_console_locale(self.env)),
+           'iso8601': get_datetime_format_hint('iso8601'),
+        }
         yield ('session list', '[sid[:0|1]] [...]',
                """List the name and email for the given sids
 
@@ -353,10 +368,11 @@ class SessionAdmin(Component):
                self._complete_delete, self._do_delete)
 
         yield ('session purge', '<age>',
-               """Purge all anonymous sessions older than the given age
+               """Purge anonymous sessions older than the given age or date
 
                Age may be specified as a relative time like "90 days ago", or
-               in YYYYMMDD format.""",
+               as a date in the "%(datetime)s" or "%(iso8601)s" (ISO 8601)
+               format.""" % hints,
                None, self._do_purge)
 
     def _split_sid(self, sid):
@@ -422,7 +438,7 @@ class SessionAdmin(Component):
         with self.env.db_transaction as db:
             try:
                 db("INSERT INTO session VALUES (%s, %s, %s)",
-                   (sid, authenticated, int(time.time())))
+                   (sid, authenticated, int(time_now())))
             except Exception:
                 raise AdminCommandError(_("Session '%(sid)s' already exists",
                                           sid=sid))
@@ -432,6 +448,7 @@ class SessionAdmin(Component):
             if email is not None:
                 db("INSERT INTO session_attribute VALUES (%s,%s,'email',%s)",
                     (sid, authenticated, email))
+        self.env.invalidate_known_users_cache()
 
     def _do_set(self, attr, sid, val):
         if attr not in ('name', 'email'):
@@ -450,6 +467,7 @@ class SessionAdmin(Component):
                 """, (sid, authenticated, attr))
             db("INSERT INTO session_attribute VALUES (%s, %s, %s, %s)",
                (sid, authenticated, attr, val))
+        self.env.invalidate_known_users_cache()
 
     def _do_delete(self, *sids):
         with self.env.db_transaction as db:
@@ -467,9 +485,11 @@ class SessionAdmin(Component):
                         DELETE FROM session_attribute
                         WHERE sid=%s AND authenticated=%s
                         """, (sid, authenticated))
+        self.env.invalidate_known_users_cache()
 
     def _do_purge(self, age):
-        when = parse_date(age)
+        when = parse_date(age, hint='datetime',
+                          locale=get_console_locale(self.env))
         with self.env.db_transaction as db:
             ts = to_timestamp(when)
             db("""
