@@ -51,6 +51,10 @@ class EmptyEnvironmentTestCase(unittest.TestCase):
         self.env.shutdown() # really closes the db connections
         shutil.rmtree(self.env.path)
 
+    def cleanupEnvPath(self, path):
+        if os.path.exists(path):
+            shutil.rmtree(path)
+
     def test_get_version(self):
         """Testing env.get_version"""
         self.assertFalse(self.env.get_version())
@@ -60,6 +64,7 @@ class EnvironmentTestCase(unittest.TestCase):
 
     def setUp(self):
         env_path = tempfile.mkdtemp(prefix='trac-tempenv-')
+        # self.addCleanup(self.cleanupEnvPath, env_path)
         self.env = Environment(env_path, create=True)
         self.env.config.set('trac', 'base_url',
                             'http://trac.edgewall.org/some/path')
